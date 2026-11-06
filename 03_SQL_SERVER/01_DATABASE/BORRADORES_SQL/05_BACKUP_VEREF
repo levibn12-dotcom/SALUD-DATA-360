@@ -1,1 +1,103 @@
 
+/* =====================================================================
+   05_backup_y_verificacion.sql
+   Proposito: (a) copia de seguridad FULL con verificacion, (b) consultas de control
+              que comparan el CSV, el staging, lo depurado, la cuarentena y el DW.
+   NO contiene RESTORE sobre la base en uso. El bloque de prueba de restauracion
+   (al final) esta comentado y restaura en una base DISTINTA.
+   Requiere : scripts 01 a 04 ejecutados.
+   ===================================================================== */
+USE BD_DataSalud_LaLibertad;
+GO
+
+-- ---------------------------------------------------------------------
+-- 1. Copia de seguridad FULL con nombre unico por fecha y hora
+--    Cambie @carpeta por una carpeta donde el servicio de SQL Server pueda escribir.
+-- ---------------------------------------------------------------------
+DECLARE @carpeta NVARCHAR(260) = N'C:\Public\';
+DECLARE @archivo NVARCHAR(400) =
+        @carpeta + N'BD_DataSalud_LaLibertad_FULL_' + CONVERT(NVARCHAR(8), GETDATE(), 112) + N'_' +
+        REPLACE(CONVERT(NVARCHAR(8), GETDATE(), 108), N':', N'') + N'.bak';
+
+BACKUP DATABASE BD_DataSalud_LaLibertad
+    TO DISK = @archivo
+    WITH CHECKSUM, STATS = 10, NAME = N'BD_DataSalud_LaLibertad FULL';
+
+-- Verifica que el archivo se puede leer (no restaura nada)
+RESTORE VERIFYONLY FROM DISK = @archivo WITH CHECKSUM;
+
+PRINT N'Copia generada y verificada: ' + @archivo;
+GO
+
+-- ---------------------------------------------------------------------
+-- 2. Verificaciones (resultado esperado con el CSV original entre parentesis)
+-- ---------------------------------------------------------------------
+-- 2.1 Cuadre por lote: filas del staging = limpias + cuarentena (diferencia 0)
+SELECT id_lote, archivo, estado, filas_staging, filas_limpias, filas_cuarentena,
+       diferencia_filas, casos_staging, casos_limpios, casos_cuarentena
+FROM dbo.tbl_bitacora_carga
+ORDER BY id_lote DESC;          -- (filas_staging 236,527; casos_staging 2,148,956)
+
+-- 2.2 Motivos de rechazo y su peso
+SELECT id_lote, motivo_error, COUNT(*) AS filas, SUM(TRY_CAST(Casos AS BIGINT)) AS casos
+FROM dbo.tbl_cuarentena_tamizajes
+GROUP BY id_lote, motivo_error
+ORDER BY id_lote, filas DESC;   -- (52 filas del ubigeo 120135 por provincia inconsistente)
+
+-- 2.3 Filas rechazadas pendientes de revision
+SELECT TOP (100) *
+FROM dbo.tbl_cuarentena_tamizajes
+WHERE estado_revision = 'PENDIENTE'
+ORDER BY id_cuarentena;
+
+-- 2.4 Duplicados en la tabla depurada por clave natural (debe devolver 0 filas)
+SELECT anio, nro_mes, ubigeo, sexo, etapa, grupo_tamizaje, detalle_tamizaje, COUNT(*) AS veces
+FROM dbo.tbl_tamizajes_salud_mental_limpio
+GROUP BY anio, nro_mes, ubigeo, sexo, etapa, grupo_tamizaje, detalle_tamizaje
+HAVING COUNT(*) > 1;
+
+-- 2.5 Ubigeos sin 6 digitos en lo depurado (debe devolver 0 filas)
+SELECT TOP (50) id_tamizaje, ubigeo
+FROM dbo.tbl_tamizajes_salud_mental_limpio
+WHERE dbo.fn_ubigeo_valido(ubigeo) = 0;
+
+-- 2.6 Depurado vs DW (filas y casos deben coincidir si el DW se cargo sin filtro)
+SELECT 'depurada' AS capa, COUNT(*) AS filas, SUM(CAST(casos AS BIGINT)) AS casos
+FROM dbo.tbl_tamizajes_salud_mental_limpio
+UNION ALL
+SELECT 'dw.Fact_Tamizajes', COUNT(*), SUM(CAST(casos AS BIGINT)) FROM dw.Fact_Tamizajes;
+
+-- 2.7 Casos por tipo de medida (nunca se suman entre si)
+SELECT z.tipo_medida, COUNT(*) AS filas, SUM(CAST(f.casos AS BIGINT)) AS casos
+FROM dw.Fact_Tamizajes f
+JOIN dw.Dim_Tamizaje z ON z.sk_tamizaje = f.sk_tamizaje
+GROUP BY z.tipo_medida;         -- (TOTAL 2,052,209 = 2,052,384 menos 175 casos en cuarentena / POSITIVO 90,927 / VIOLENCIA_POLITICA 5,645)
+
+-- 2.8 Filas marcadas para revision: positivos que superan al total
+SELECT COUNT(*) AS filas_marcadas
+FROM dbo.tbl_tamizajes_salud_mental_limpio
+WHERE bandera_positivos_gt_total = 1;
+
+-- 2.9 Meses incompletos (no comparar contra meses completos)
+SELECT anio, nro_mes, nombre_mes, es_mes_parcial FROM dw.Dim_Tiempo ORDER BY anio, nro_mes;   -- (mes 9 de 2017)
+
+-- 2.10 La Libertad dentro del total
+SELECT departamento, COUNT(*) AS filas, SUM(CAST(casos AS BIGINT)) AS casos
+FROM dbo.tbl_tamizajes_salud_mental_limpio
+GROUP BY departamento
+ORDER BY filas DESC;            -- (LA LIBERTAD: 3,287 filas en el CSV; 10,557 casos)
+GO
+
+-- ---------------------------------------------------------------------
+-- 3. Prueba de restauracion SEGURA (comentada): restaura en otra base, nunca sobre la actual.
+--    1) Consulte los nombres logicos:   RESTORE FILELISTONLY FROM DISK = N'<ruta del .bak>';
+--    2) Ajuste los nombres y rutas de MOVE y ejecute en la base master.
+-- ---------------------------------------------------------------------
+-- USE master;
+-- RESTORE DATABASE BD_DataSalud_LaLibertad_PRUEBA
+--     FROM DISK = N'C:\Public\BD_DataSalud_LaLibertad_FULL_AAAAMMDD_HHMMSS.bak'
+--     WITH MOVE N'<nombre_logico_datos>' TO N'C:\Public\BD_DataSalud_LaLibertad_PRUEBA.mdf',
+--          MOVE N'<nombre_logico_log>'   TO N'C:\Public\BD_DataSalud_LaLibertad_PRUEBA.ldf',
+--          STATS = 10;
+-- SELECT COUNT(*) FROM BD_DataSalud_LaLibertad_PRUEBA.dbo.tbl_tamizajes_salud_mental_limpio;
+GO
