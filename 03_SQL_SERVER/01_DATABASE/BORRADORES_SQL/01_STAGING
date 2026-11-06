@@ -1,1 +1,204 @@
 
+/* =====================================================================
+   01_staging_y_control.sql
+   Proposito: crear el eslabon que falta entre el CSV y la tabla depurada:
+              esquemas stg/dw, staging en texto, cuarentena y bitacora de cargas.
+   Caracteristicas: repetible (IF ... IS NULL), no borra ni trunca nada,
+                    no toca las tablas existentes.
+   Requiere : haber ejecutado 00_diagnostico_previo.sql (opcional).
+   ===================================================================== */
+USE BD_DataSalud_LaLibertad;
+GO
+
+-- Esquemas: stg = datos crudos, dw = Data Warehouse
+IF SCHEMA_ID(N'stg') IS NULL EXEC(N'CREATE SCHEMA stg AUTHORIZATION dbo;');
+IF SCHEMA_ID(N'dw')  IS NULL EXEC(N'CREATE SCHEMA dw AUTHORIZATION dbo;');
+GO
+
+-- ---------------------------------------------------------------------
+-- Bitacora de cargas: una fila por lote (carga del CSV + su depuracion)
+-- ---------------------------------------------------------------------
+IF OBJECT_ID(N'dbo.tbl_bitacora_carga', N'U') IS NULL
+CREATE TABLE dbo.tbl_bitacora_carga (
+    id_lote           INT IDENTITY(1,1) CONSTRAINT PK_bitacora_carga PRIMARY KEY,
+    archivo           NVARCHAR(500)  NULL,
+    fecha_inicio      DATETIME2(0)   NOT NULL CONSTRAINT DF_bitacora_inicio DEFAULT SYSDATETIME(),
+    fecha_fin         DATETIME2(0)   NULL,
+    filas_staging     INT            NULL,
+    casos_staging     BIGINT         NULL,
+    filas_limpias     INT            NULL,
+    casos_limpios     BIGINT         NULL,
+    filas_cuarentena  INT            NULL,
+    casos_cuarentena  BIGINT         NULL,
+    diferencia_filas  INT            NULL,   -- staging - (limpias + cuarentena); debe ser 0
+    estado            VARCHAR(30)    NOT NULL CONSTRAINT DF_bitacora_estado DEFAULT 'CARGANDO',
+    mensaje           NVARCHAR(4000) NULL
+);
+GO
+
+-- ---------------------------------------------------------------------
+-- Staging: copia fiel del CSV, todo en texto (no se limpia nada aqui)
+-- ---------------------------------------------------------------------
+IF OBJECT_ID(N'stg.tamizajes_raw', N'U') IS NULL
+CREATE TABLE stg.tamizajes_raw (
+    id_fila         INT IDENTITY(1,1) CONSTRAINT PK_stg_tamizajes_raw PRIMARY KEY,
+    Anio            VARCHAR(10)  NULL,
+    NroMes          VARCHAR(10)  NULL,
+    ubigeo          VARCHAR(20)  NULL,   -- texto: conserva el cero inicial (020101)
+    Departamento    VARCHAR(100) NULL,
+    Provincia       VARCHAR(100) NULL,
+    Distrito        VARCHAR(100) NULL,
+    Sexo            VARCHAR(10)  NULL,
+    Etapa           VARCHAR(50)  NULL,
+    GrupoTamizaje   VARCHAR(150) NULL,
+    DetalleTamizaje VARCHAR(150) NULL,
+    Casos           VARCHAR(20)  NULL,
+    id_lote         INT          NULL,   -- se asigna despues de cada carga
+    fecha_carga     DATETIME2(0) NOT NULL CONSTRAINT DF_stg_tamizajes_fecha DEFAULT SYSDATETIME()
+);
+GO
+
+-- Vista con solo las 11 columnas del CSV: es el destino de BULK INSERT
+CREATE OR ALTER VIEW stg.v_tamizajes_raw_carga AS
+SELECT Anio, NroMes, ubigeo, Departamento, Provincia, Distrito, Sexo, Etapa,
+       GrupoTamizaje, DetalleTamizaje, Casos
+FROM stg.tamizajes_raw;
+GO
+
+-- ---------------------------------------------------------------------
+-- Cuarentena de tamizajes: filas rechazadas, revisables y reprocesables
+-- ---------------------------------------------------------------------
+IF OBJECT_ID(N'dbo.tbl_cuarentena_tamizajes', N'U') IS NULL
+CREATE TABLE dbo.tbl_cuarentena_tamizajes (
+    id_cuarentena    INT IDENTITY(1,1) CONSTRAINT PK_cuarentena_tamizajes PRIMARY KEY,
+    id_lote          INT           NOT NULL,
+    id_fila_staging  INT           NOT NULL,
+    Anio             VARCHAR(10)   NULL,
+    NroMes           VARCHAR(10)   NULL,
+    ubigeo           VARCHAR(20)   NULL,
+    Departamento     VARCHAR(100)  NULL,
+    Provincia        VARCHAR(100)  NULL,
+    Distrito         VARCHAR(100)  NULL,
+    Sexo             VARCHAR(10)   NULL,
+    Etapa            VARCHAR(50)   NULL,
+    GrupoTamizaje    VARCHAR(150)  NULL,
+    DetalleTamizaje  VARCHAR(150)  NULL,
+    Casos            VARCHAR(20)   NULL,
+    motivo_error     VARCHAR(255)  NOT NULL,
+    estado_revision  VARCHAR(20)   NOT NULL CONSTRAINT DF_cuarentena_estado DEFAULT 'PENDIENTE',
+    observacion      VARCHAR(500)  NULL,
+    fecha_rechazo    DATETIME2(0)  NOT NULL CONSTRAINT DF_cuarentena_fecha DEFAULT SYSDATETIME(),
+    CONSTRAINT UQ_cuarentena_lote_fila UNIQUE (id_lote, id_fila_staging)
+);
+GO
+
+-- ---------------------------------------------------------------------
+-- Procedimiento A: cargar el CSV directamente desde una ruta del SERVIDOR
+--   Requisitos: permiso ADMINISTER BULK OPERATIONS y que SQL Server pueda leer la ruta.
+--   Codigo de pagina 1252 (el CSV trae Ñ, É, Í). Si BULK INSERT falla por el fin de
+--   linea, agregue ROWTERMINATOR = '0x0a' en la instruccion.
+-- ---------------------------------------------------------------------
+CREATE OR ALTER PROCEDURE stg.usp_cargar_csv_tamizajes
+    @ruta    NVARCHAR(500),
+    @id_lote INT OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF @ruta IS NULL OR RIGHT(LOWER(@ruta), 4) <> N'.csv'
+        THROW 50010, 'La ruta debe apuntar a un archivo .csv', 1;
+
+    INSERT INTO dbo.tbl_bitacora_carga (archivo, estado) VALUES (@ruta, 'CARGANDO');
+    SET @id_lote = CAST(SCOPE_IDENTITY() AS INT);
+
+    BEGIN TRY
+        DECLARE @sql NVARCHAR(MAX) =
+            N'BULK INSERT stg.v_tamizajes_raw_carga FROM N''' + REPLACE(@ruta, N'''', N'''''') +
+            N''' WITH (FORMAT = ''CSV'', FIRSTROW = 2, FIELDTERMINATOR = '','', CODEPAGE = ''1252'', TABLOCK);';
+        EXEC sys.sp_executesql @sql;
+
+        UPDATE stg.tamizajes_raw SET id_lote = @id_lote WHERE id_lote IS NULL;
+        DECLARE @n INT = @@ROWCOUNT;
+
+        UPDATE dbo.tbl_bitacora_carga
+           SET filas_staging = @n, estado = 'CARGADO'
+         WHERE id_lote = @id_lote;
+    END TRY
+    BEGIN CATCH
+        UPDATE dbo.tbl_bitacora_carga
+           SET estado = 'ERROR', fecha_fin = SYSDATETIME(), mensaje = LEFT(ERROR_MESSAGE(), 4000)
+         WHERE id_lote = @id_lote;
+        THROW;
+    END CATCH;
+END;
+GO
+
+-- ---------------------------------------------------------------------
+-- Procedimiento B: copiar a staging lo que ya importo el asistente de SSMS
+--   Origen: dbo.[DAT SALUD MENTAL - TAMIZAJE]
+--   Unica reparacion: si el asistente cargo el ubigeo como numero, los ubigeos de
+--   5 digitos (ej. 20101) reciben su cero inicial (020101). Queda anotado en la bitacora.
+-- ---------------------------------------------------------------------
+CREATE OR ALTER PROCEDURE stg.usp_copiar_desde_importacion
+    @id_lote INT OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF OBJECT_ID(N'dbo.[DAT SALUD MENTAL - TAMIZAJE]', N'U') IS NULL
+        THROW 50011, 'No existe dbo.[DAT SALUD MENTAL - TAMIZAJE]. Use stg.usp_cargar_csv_tamizajes.', 1;
+
+    INSERT INTO dbo.tbl_bitacora_carga (archivo, estado)
+    VALUES (N'tabla dbo.[DAT SALUD MENTAL - TAMIZAJE]', 'CARGANDO');
+    SET @id_lote = CAST(SCOPE_IDENTITY() AS INT);
+
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        INSERT INTO stg.tamizajes_raw
+            (Anio, NroMes, ubigeo, Departamento, Provincia, Distrito, Sexo, Etapa,
+             GrupoTamizaje, DetalleTamizaje, Casos, id_lote)
+        SELECT CAST(Anio AS VARCHAR(10)),
+               CAST(NroMes AS VARCHAR(10)),
+               CASE WHEN LEN(LTRIM(RTRIM(CAST(ubigeo AS VARCHAR(20))))) = 5
+                    THEN '0' + LTRIM(RTRIM(CAST(ubigeo AS VARCHAR(20))))
+                    ELSE LTRIM(RTRIM(CAST(ubigeo AS VARCHAR(20)))) END,
+               CAST(Departamento AS VARCHAR(100)),
+               CAST(Provincia AS VARCHAR(100)),
+               CAST(Distrito AS VARCHAR(100)),
+               CAST(Sexo AS VARCHAR(10)),
+               CAST(Etapa AS VARCHAR(50)),
+               CAST(GrupoTamizaje AS VARCHAR(150)),
+               CAST(DetalleTamizaje AS VARCHAR(150)),
+               CAST(Casos AS VARCHAR(20)),
+               @id_lote
+        FROM dbo.[DAT SALUD MENTAL - TAMIZAJE];
+        DECLARE @n INT = @@ROWCOUNT;
+
+        UPDATE dbo.tbl_bitacora_carga
+           SET filas_staging = @n, estado = 'CARGADO',
+               mensaje = N'Copiado desde la tabla importada. Ubigeos de 5 digitos completados con cero inicial.'
+         WHERE id_lote = @id_lote;
+
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        UPDATE dbo.tbl_bitacora_carga
+           SET estado = 'ERROR', fecha_fin = SYSDATETIME(), mensaje = LEFT(ERROR_MESSAGE(), 4000)
+         WHERE id_lote = @id_lote;
+        THROW;
+    END CATCH;
+END;
+GO
+
+-- ---------------------------------------------------------------------
+-- Verificacion (resultado esperado con el CSV original: 236,527 filas)
+--   Para cargar, ejecute UNA de estas dos opciones y luego el script 02:
+--     DECLARE @lote INT;  EXEC stg.usp_cargar_csv_tamizajes N'C:\ruta\DAT SALUD MENTAL - TAMIZAJE.csv', @lote OUTPUT;
+--     DECLARE @lote INT;  EXEC stg.usp_copiar_desde_importacion @lote OUTPUT;
+-- ---------------------------------------------------------------------
+SELECT id_lote, archivo, filas_staging, estado, mensaje
+FROM dbo.tbl_bitacora_carga
+ORDER BY id_lote DESC;
+GO
