@@ -1,1 +1,197 @@
 
+/* =====================================================================
+   03_modelo_dw.sql
+   Proposito: Data Warehouse en estrella (Kimball) corregido, en el esquema dw.
+   Grano    : un registro por mes, ubigeo, sexo+etapa y grupo+detalle de tamizaje
+              (equivale a una fila de dbo.tbl_tamizajes_salud_mental_limpio).
+   Medida   : casos. Solo se suma dentro de un mismo tipo_medida
+              (TOTAL, POSITIVO o VIOLENCIA_POLITICA): los positivos son un subconjunto
+              del total, por eso mezclarlos duplica conteos.
+   Nota     : las tablas antiguas dbo.Dim_* y dbo.Fact_Tamizajes NO se tocan ni se borran;
+              quedan como version anterior. Este modelo vive en dw.* para no chocar con ellas.
+   Requiere : scripts 01 y 02 ejecutados y datos en dbo.tbl_tamizajes_salud_mental_limpio.
+   Repetible: si; las cargas insertan solo lo que falta.
+   ===================================================================== */
+USE BD_DataSalud_LaLibertad;
+GO
+
+-- ---------------------------------------------------------------------
+-- 1. Dimensiones
+-- ---------------------------------------------------------------------
+IF OBJECT_ID(N'dw.Dim_Ubicacion', N'U') IS NULL
+CREATE TABLE dw.Dim_Ubicacion (
+    sk_ubicacion INT IDENTITY(1,1) CONSTRAINT PK_dw_Dim_Ubicacion PRIMARY KEY,
+    ubigeo       CHAR(6)      NOT NULL CONSTRAINT UQ_dw_Dim_Ubicacion_ubigeo UNIQUE,
+    departamento VARCHAR(100) NOT NULL,
+    provincia    VARCHAR(100) NOT NULL,
+    distrito     VARCHAR(100) NOT NULL
+);
+GO
+
+IF OBJECT_ID(N'dw.Dim_Tiempo', N'U') IS NULL
+CREATE TABLE dw.Dim_Tiempo (
+    sk_tiempo      INT         NOT NULL CONSTRAINT PK_dw_Dim_Tiempo PRIMARY KEY,   -- AAAAMM
+    anio           SMALLINT    NOT NULL,
+    nro_mes        TINYINT     NOT NULL CONSTRAINT CK_dw_Dim_Tiempo_mes CHECK (nro_mes BETWEEN 1 AND 12),
+    nombre_mes     VARCHAR(12) NOT NULL,
+    trimestre      TINYINT     NOT NULL,
+    es_mes_parcial BIT         NOT NULL CONSTRAINT DF_dw_Dim_Tiempo_parcial DEFAULT 0,
+    CONSTRAINT UQ_dw_Dim_Tiempo UNIQUE (anio, nro_mes)
+);
+GO
+
+-- Quien fue tamizado
+IF OBJECT_ID(N'dw.Dim_Demografia', N'U') IS NULL
+CREATE TABLE dw.Dim_Demografia (
+    sk_demografia INT IDENTITY(1,1) CONSTRAINT PK_dw_Dim_Demografia PRIMARY KEY,
+    sexo          CHAR(1)     NOT NULL CONSTRAINT CK_dw_Dim_Demografia_sexo CHECK (sexo IN ('F', 'M')),
+    etapa         VARCHAR(20) NOT NULL,
+    orden_etapa   TINYINT     NULL,
+    CONSTRAINT UQ_dw_Dim_Demografia UNIQUE (sexo, etapa)
+);
+GO
+
+-- Que se midio
+IF OBJECT_ID(N'dw.Dim_Tamizaje', N'U') IS NULL
+CREATE TABLE dw.Dim_Tamizaje (
+    sk_tamizaje      INT IDENTITY(1,1) CONSTRAINT PK_dw_Dim_Tamizaje PRIMARY KEY,
+    grupo_tamizaje   VARCHAR(100) NOT NULL,
+    detalle_tamizaje VARCHAR(100) NOT NULL,
+    tipo_medida      VARCHAR(30)  NOT NULL,   -- TOTAL | POSITIVO | VIOLENCIA_POLITICA | OTRO
+    CONSTRAINT UQ_dw_Dim_Tamizaje UNIQUE (grupo_tamizaje, detalle_tamizaje)
+);
+GO
+
+-- ---------------------------------------------------------------------
+-- 2. Tabla de hechos
+-- ---------------------------------------------------------------------
+IF OBJECT_ID(N'dw.Fact_Tamizajes', N'U') IS NULL
+CREATE TABLE dw.Fact_Tamizajes (
+    sk_fact                    INT IDENTITY(1,1) CONSTRAINT PK_dw_Fact_Tamizajes PRIMARY KEY,
+    sk_tiempo                  INT NOT NULL CONSTRAINT FK_dw_Fact_Tiempo     REFERENCES dw.Dim_Tiempo (sk_tiempo),
+    sk_ubicacion               INT NOT NULL CONSTRAINT FK_dw_Fact_Ubicacion  REFERENCES dw.Dim_Ubicacion (sk_ubicacion),
+    sk_demografia              INT NOT NULL CONSTRAINT FK_dw_Fact_Demografia REFERENCES dw.Dim_Demografia (sk_demografia),
+    sk_tamizaje                INT NOT NULL CONSTRAINT FK_dw_Fact_Tamizaje   REFERENCES dw.Dim_Tamizaje (sk_tamizaje),
+    casos                      INT NOT NULL CONSTRAINT CK_dw_Fact_casos CHECK (casos >= 1),
+    bandera_positivos_gt_total BIT NOT NULL CONSTRAINT DF_dw_Fact_bandera DEFAULT 0,
+    id_tamizaje_origen         INT NOT NULL,   -- linaje: dbo.tbl_tamizajes_salud_mental_limpio.id_tamizaje
+    CONSTRAINT UQ_dw_Fact_origen UNIQUE (id_tamizaje_origen),
+    CONSTRAINT UQ_dw_Fact_grano  UNIQUE (sk_tiempo, sk_ubicacion, sk_demografia, sk_tamizaje)
+);
+GO
+
+-- Indices para las uniones y filtros mas usados (la clave unica del grano ya cubre sk_tiempo)
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_dw_Fact_ubicacion' AND object_id = OBJECT_ID(N'dw.Fact_Tamizajes'))
+    CREATE NONCLUSTERED INDEX IX_dw_Fact_ubicacion ON dw.Fact_Tamizajes (sk_ubicacion) INCLUDE (casos);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_dw_Fact_tamizaje' AND object_id = OBJECT_ID(N'dw.Fact_Tamizajes'))
+    CREATE NONCLUSTERED INDEX IX_dw_Fact_tamizaje ON dw.Fact_Tamizajes (sk_tamizaje) INCLUDE (casos);
+GO
+
+-- ---------------------------------------------------------------------
+-- 3. Carga (ETL) repetible desde la tabla depurada
+--    @departamento = NULL carga todo el pais; use 'LA LIBERTAD' para limitar el DW a la DIRESA.
+-- ---------------------------------------------------------------------
+CREATE OR ALTER PROCEDURE dw.usp_cargar_dw_tamizajes
+    @departamento VARCHAR(100) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        -- Ubicacion: una sola fila por ubigeo (si hubiera varias provincias, gana la mas frecuente)
+        ;WITH u AS (
+            SELECT ubigeo, departamento, provincia, distrito,
+                   ROW_NUMBER() OVER (PARTITION BY ubigeo ORDER BY COUNT(*) DESC, provincia) AS rn
+            FROM dbo.tbl_tamizajes_salud_mental_limpio
+            WHERE (@departamento IS NULL OR departamento = @departamento)
+            GROUP BY ubigeo, departamento, provincia, distrito
+        )
+        INSERT INTO dw.Dim_Ubicacion (ubigeo, departamento, provincia, distrito)
+        SELECT u.ubigeo, u.departamento, u.provincia, u.distrito
+        FROM u
+        WHERE u.rn = 1
+          AND NOT EXISTS (SELECT 1 FROM dw.Dim_Ubicacion d WHERE d.ubigeo = u.ubigeo);
+
+        -- Tiempo
+        INSERT INTO dw.Dim_Tiempo (sk_tiempo, anio, nro_mes, nombre_mes, trimestre)
+        SELECT DISTINCT l.anio * 100 + l.nro_mes, l.anio, l.nro_mes,
+               CHOOSE(l.nro_mes, 'ENERO', 'FEBRERO', 'MARZO', 'ABRIL', 'MAYO', 'JUNIO', 'JULIO',
+                      'AGOSTO', 'SETIEMBRE', 'OCTUBRE', 'NOVIEMBRE', 'DICIEMBRE'),
+               (l.nro_mes - 1) / 3 + 1
+        FROM dbo.tbl_tamizajes_salud_mental_limpio l
+        WHERE (@departamento IS NULL OR l.departamento = @departamento)
+          AND l.anio IS NOT NULL AND l.nro_mes BETWEEN 1 AND 12
+          AND NOT EXISTS (SELECT 1 FROM dw.Dim_Tiempo t WHERE t.anio = l.anio AND t.nro_mes = l.nro_mes);
+
+        -- Mes parcial: un mes con menos del 10% de las filas del mes promedio
+        ;WITH m AS (
+            SELECT anio, nro_mes, COUNT(*) AS n
+            FROM dbo.tbl_tamizajes_salud_mental_limpio
+            WHERE (@departamento IS NULL OR departamento = @departamento)
+            GROUP BY anio, nro_mes
+        ), p AS (
+            SELECT anio, nro_mes, n, AVG(CAST(n AS FLOAT)) OVER () AS promedio FROM m
+        )
+        UPDATE t SET es_mes_parcial = CASE WHEN p.n < 0.10 * p.promedio THEN 1 ELSE 0 END
+        FROM dw.Dim_Tiempo t
+        JOIN p ON p.anio = t.anio AND p.nro_mes = t.nro_mes;
+
+        -- Demografia
+        INSERT INTO dw.Dim_Demografia (sexo, etapa, orden_etapa)
+        SELECT DISTINCT l.sexo, l.etapa, dbo.fn_orden_etapa(l.etapa)
+        FROM dbo.tbl_tamizajes_salud_mental_limpio l
+        WHERE (@departamento IS NULL OR l.departamento = @departamento)
+          AND l.sexo IN ('F', 'M') AND l.etapa IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM dw.Dim_Demografia d WHERE d.sexo = l.sexo AND d.etapa = l.etapa);
+
+        -- Tipo de tamizaje
+        INSERT INTO dw.Dim_Tamizaje (grupo_tamizaje, detalle_tamizaje, tipo_medida)
+        SELECT DISTINCT l.grupo_tamizaje, l.detalle_tamizaje,
+               CASE l.grupo_tamizaje
+                    WHEN 'TOTAL DE TAMIZAJES' THEN 'TOTAL'
+                    WHEN 'SOLO TAMIZAJES POSITIVOS' THEN 'POSITIVO'
+                    WHEN 'TAMIZAJES C/CONDICION ADICIONAL VIOLENCIA POLITICA' THEN 'VIOLENCIA_POLITICA'
+                    ELSE 'OTRO' END
+        FROM dbo.tbl_tamizajes_salud_mental_limpio l
+        WHERE (@departamento IS NULL OR l.departamento = @departamento)
+          AND l.grupo_tamizaje IS NOT NULL AND l.detalle_tamizaje IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM dw.Dim_Tamizaje z
+                          WHERE z.grupo_tamizaje = l.grupo_tamizaje AND z.detalle_tamizaje = l.detalle_tamizaje);
+
+        -- Hechos
+        INSERT INTO dw.Fact_Tamizajes
+            (sk_tiempo, sk_ubicacion, sk_demografia, sk_tamizaje, casos,
+             bandera_positivos_gt_total, id_tamizaje_origen)
+        SELECT t.sk_tiempo, u.sk_ubicacion, d.sk_demografia, z.sk_tamizaje, l.casos,
+               l.bandera_positivos_gt_total, l.id_tamizaje
+        FROM dbo.tbl_tamizajes_salud_mental_limpio l
+        JOIN dw.Dim_Tiempo     t ON t.anio = l.anio AND t.nro_mes = l.nro_mes
+        JOIN dw.Dim_Ubicacion  u ON u.ubigeo = l.ubigeo
+        JOIN dw.Dim_Demografia d ON d.sexo = l.sexo AND d.etapa = l.etapa
+        JOIN dw.Dim_Tamizaje   z ON z.grupo_tamizaje = l.grupo_tamizaje
+                                AND z.detalle_tamizaje = l.detalle_tamizaje
+        WHERE (@departamento IS NULL OR l.departamento = @departamento)
+          AND NOT EXISTS (SELECT 1 FROM dw.Fact_Tamizajes f WHERE f.id_tamizaje_origen = l.id_tamizaje);
+
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH;
+END;
+GO
+
+-- ---------------------------------------------------------------------
+-- 4. Ejecucion y verificacion
+--    EXEC dw.usp_cargar_dw_tamizajes;                        -- todo el pais
+--    EXEC dw.usp_cargar_dw_tamizajes @departamento = 'LA LIBERTAD';
+-- ---------------------------------------------------------------------
+-- SELECT 'limpia' AS capa, COUNT(*) AS filas, SUM(CAST(casos AS BIGINT)) AS casos
+--   FROM dbo.tbl_tamizajes_salud_mental_limpio
+-- UNION ALL
+-- SELECT 'DW', COUNT(*), SUM(CAST(casos AS BIGINT)) FROM dw.Fact_Tamizajes;
+GO
