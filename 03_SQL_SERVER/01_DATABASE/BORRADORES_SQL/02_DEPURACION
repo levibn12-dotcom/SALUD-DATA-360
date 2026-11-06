@@ -1,1 +1,334 @@
 
+/* =====================================================================
+   02_depuracion_tamizajes.sql
+   Proposito: depurar el staging hacia dbo.tbl_tamizajes_salud_mental_limpio
+              (tabla existente, que se CONSERVA y se refuerza), con cuarentena,
+              bitacora y cuadre de filas. Reemplaza en la practica a
+              usp_procesar_tamizajes_salud_mental (que duplica al re-ejecutarse
+              y no registra rechazos); el procedimiento antiguo no se borra.
+   Requiere : script 01 ejecutado y un lote cargado en stg.tamizajes_raw.
+   Repetible: si, no duplica filas (compara por clave natural).
+   ===================================================================== */
+USE BD_DataSalud_LaLibertad;
+GO
+
+-- ---------------------------------------------------------------------
+-- 1. Funciones reutilizables
+-- ---------------------------------------------------------------------
+CREATE OR ALTER FUNCTION dbo.fn_ubigeo_valido (@ubigeo VARCHAR(20))
+RETURNS BIT
+AS
+BEGIN
+    RETURN CASE WHEN @ubigeo LIKE '[0-9][0-9][0-9][0-9][0-9][0-9]' THEN 1 ELSE 0 END;
+END;
+GO
+
+-- Orden numerico de la etapa de vida (el texto no ordena bien: '10 - 11' < '5 - 9')
+CREATE OR ALTER FUNCTION dbo.fn_orden_etapa (@etapa VARCHAR(50))
+RETURNS TINYINT
+AS
+BEGIN
+    RETURN CASE @etapa
+        WHEN '< 1'     THEN 0
+        WHEN '1 - 4'   THEN 1
+        WHEN '5 - 9'   THEN 2
+        WHEN '10 - 11' THEN 3
+        WHEN '12 - 14' THEN 4
+        WHEN '15 - 17' THEN 5
+        WHEN '18 - 24' THEN 6
+        WHEN '25 - 29' THEN 7
+        WHEN '30 - 39' THEN 8
+        WHEN '40 - 59' THEN 9
+        WHEN '60 - 79' THEN 10
+        WHEN '80 +'    THEN 11
+        ELSE NULL END;
+END;
+GO
+
+-- ---------------------------------------------------------------------
+-- 2. Refuerzo de la tabla depurada (sin borrar datos)
+-- ---------------------------------------------------------------------
+-- 2.0 Si la tabla depurada no existe (no se ejecuto esa parte del script original), se crea
+--     con la MISMA definicion del script original; las secciones siguientes la refuerzan.
+IF OBJECT_ID(N'dbo.tbl_tamizajes_salud_mental_limpio', N'U') IS NULL
+CREATE TABLE dbo.tbl_tamizajes_salud_mental_limpio (
+    id_tamizaje      INT IDENTITY(1,1) PRIMARY KEY,
+    anio             SMALLINT,
+    nro_mes          TINYINT,
+    ubigeo           VARCHAR(10),
+    departamento     VARCHAR(50),
+    provincia        VARCHAR(50),
+    distrito         VARCHAR(50),
+    sexo             VARCHAR(50),
+    etapa            VARCHAR(50),
+    grupo_tamizaje   VARCHAR(50),
+    detalle_tamizaje VARCHAR(50),
+    casos            INT,
+    fecha_carga      DATETIME DEFAULT GETDATE()
+);
+GO
+
+-- 2.1 Ensanchar columnas (ensanchar es seguro; GrupoTamizaje mide 50 y el limite era 50)
+IF EXISTS (SELECT 1 FROM sys.columns
+           WHERE object_id = OBJECT_ID(N'dbo.tbl_tamizajes_salud_mental_limpio')
+             AND name = 'grupo_tamizaje' AND max_length < 100)
+    ALTER TABLE dbo.tbl_tamizajes_salud_mental_limpio ALTER COLUMN grupo_tamizaje VARCHAR(100) NULL;
+IF EXISTS (SELECT 1 FROM sys.columns
+           WHERE object_id = OBJECT_ID(N'dbo.tbl_tamizajes_salud_mental_limpio')
+             AND name = 'detalle_tamizaje' AND max_length < 100)
+    ALTER TABLE dbo.tbl_tamizajes_salud_mental_limpio ALTER COLUMN detalle_tamizaje VARCHAR(100) NULL;
+GO
+
+-- 2.2 Columnas de linaje y de control
+IF COL_LENGTH(N'dbo.tbl_tamizajes_salud_mental_limpio', 'id_lote') IS NULL
+    ALTER TABLE dbo.tbl_tamizajes_salud_mental_limpio ADD id_lote INT NULL;
+IF COL_LENGTH(N'dbo.tbl_tamizajes_salud_mental_limpio', 'id_fila_staging') IS NULL
+    ALTER TABLE dbo.tbl_tamizajes_salud_mental_limpio ADD id_fila_staging INT NULL;
+IF COL_LENGTH(N'dbo.tbl_tamizajes_salud_mental_limpio', 'orden_etapa') IS NULL
+    ALTER TABLE dbo.tbl_tamizajes_salud_mental_limpio ADD orden_etapa TINYINT NULL;
+IF COL_LENGTH(N'dbo.tbl_tamizajes_salud_mental_limpio', 'bandera_positivos_gt_total') IS NULL
+    ALTER TABLE dbo.tbl_tamizajes_salud_mental_limpio
+        ADD bandera_positivos_gt_total BIT NOT NULL
+            CONSTRAINT DF_limpio_bandera DEFAULT 0;
+GO
+
+-- 2.3 Restricciones. Solo se crean si la tabla esta VACIA: si ya tiene filas de la carga
+--     antigua (posibles duplicados o ubigeos sin cero), crearlas fallaria. En ese caso el
+--     trigger de integridad del script 04 protege las filas nuevas.
+IF NOT EXISTS (SELECT 1 FROM dbo.tbl_tamizajes_salud_mental_limpio)
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_limpio_casos')
+        ALTER TABLE dbo.tbl_tamizajes_salud_mental_limpio
+            ADD CONSTRAINT CK_limpio_casos CHECK (casos >= 1);
+    IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_limpio_mes')
+        ALTER TABLE dbo.tbl_tamizajes_salud_mental_limpio
+            ADD CONSTRAINT CK_limpio_mes CHECK (nro_mes BETWEEN 1 AND 12);
+    IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_limpio_sexo')
+        ALTER TABLE dbo.tbl_tamizajes_salud_mental_limpio
+            ADD CONSTRAINT CK_limpio_sexo CHECK (sexo IN ('F', 'M'));
+    IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_limpio_ubigeo')
+        ALTER TABLE dbo.tbl_tamizajes_salud_mental_limpio
+            ADD CONSTRAINT CK_limpio_ubigeo CHECK (ubigeo LIKE '[0-9][0-9][0-9][0-9][0-9][0-9]');
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes
+                   WHERE name = 'UX_limpio_clave_natural'
+                     AND object_id = OBJECT_ID(N'dbo.tbl_tamizajes_salud_mental_limpio'))
+        CREATE UNIQUE NONCLUSTERED INDEX UX_limpio_clave_natural
+            ON dbo.tbl_tamizajes_salud_mental_limpio
+               (anio, nro_mes, ubigeo, sexo, etapa, grupo_tamizaje, detalle_tamizaje);
+END
+ELSE
+    PRINT 'AVISO: la tabla limpia ya tiene filas; no se crearon CHECK ni indice unico. Revise duplicados con 05_backup_y_verificacion.sql.';
+GO
+
+-- 2.4 Indice de rendimiento del script original (se conserva, ahora con creacion segura)
+IF NOT EXISTS (SELECT 1 FROM sys.indexes
+               WHERE name = 'IX_Tamizajes_Provincia_Anio'
+                 AND object_id = OBJECT_ID(N'dbo.tbl_tamizajes_salud_mental_limpio'))
+    CREATE NONCLUSTERED INDEX IX_Tamizajes_Provincia_Anio
+        ON dbo.tbl_tamizajes_salud_mental_limpio (provincia, anio)
+        INCLUDE (casos, etapa);
+GO
+
+-- ---------------------------------------------------------------------
+-- 3. Procedimiento de depuracion
+--    Reglas (cada fila recibe como maximo UN motivo; la primera que falle):
+--      a) campos criticos vacios o no numericos
+--      b) ubigeo distinto de 6 digitos
+--      c) sexo distinto de F / M
+--      d) provincia o departamento que no coincide con el que domina el prefijo del ubigeo
+--         (regla provisoria hasta contar con el catalogo oficial del INEI)
+--      e) clave repetida: duplicado exacto (se conserva uno) o con casos distintos (todos a revision)
+--    Nada se elimina del staging. Lo rechazado queda en dbo.tbl_cuarentena_tamizajes.
+-- ---------------------------------------------------------------------
+CREATE OR ALTER PROCEDURE dbo.usp_depurar_tamizajes
+    @id_lote INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    IF NOT EXISTS (SELECT 1 FROM dbo.tbl_bitacora_carga WHERE id_lote = @id_lote)
+        THROW 50001, 'El lote no existe en dbo.tbl_bitacora_carga.', 1;
+    IF NOT EXISTS (SELECT 1 FROM stg.tamizajes_raw WHERE id_lote = @id_lote)
+        THROW 50002, 'No hay filas en staging para el lote indicado.', 1;
+
+    BEGIN TRY
+        -- 3.1 Normalizar el lote en una tabla temporal (el staging no se modifica)
+        CREATE TABLE #lote (
+            id_fila      INT          NOT NULL PRIMARY KEY,
+            anio         SMALLINT     NULL,
+            nro_mes      SMALLINT     NULL,
+            ubigeo       VARCHAR(20)  NULL,
+            departamento VARCHAR(100) NULL,
+            provincia    VARCHAR(100) NULL,
+            distrito     VARCHAR(100) NULL,
+            sexo         VARCHAR(10)  NULL,
+            etapa        VARCHAR(50)  NULL,
+            grupo        VARCHAR(150) NULL,
+            detalle      VARCHAR(150) NULL,
+            casos        INT          NULL,
+            motivo       VARCHAR(255) NULL
+        );
+
+        INSERT INTO #lote (id_fila, anio, nro_mes, ubigeo, departamento, provincia, distrito,
+                           sexo, etapa, grupo, detalle, casos)
+        SELECT s.id_fila,
+               TRY_CAST(NULLIF(LTRIM(RTRIM(s.Anio)), '')   AS SMALLINT),
+               TRY_CAST(NULLIF(LTRIM(RTRIM(s.NroMes)), '') AS SMALLINT),
+               UPPER(NULLIF(LTRIM(RTRIM(s.ubigeo)), '')),
+               UPPER(NULLIF(LTRIM(RTRIM(s.Departamento)), '')),
+               UPPER(NULLIF(LTRIM(RTRIM(s.Provincia)), '')),
+               UPPER(NULLIF(LTRIM(RTRIM(s.Distrito)), '')),
+               UPPER(NULLIF(LTRIM(RTRIM(s.Sexo)), '')),
+               REPLACE(REPLACE(UPPER(NULLIF(LTRIM(RTRIM(s.Etapa)), '')), '  ', ' '), '  ', ' '),
+               UPPER(NULLIF(LTRIM(RTRIM(s.GrupoTamizaje)), '')),
+               UPPER(NULLIF(LTRIM(RTRIM(s.DetalleTamizaje)), '')),
+               TRY_CAST(NULLIF(LTRIM(RTRIM(s.Casos)), '') AS INT)
+        FROM stg.tamizajes_raw s
+        WHERE s.id_lote = @id_lote;
+
+        -- 3.2 Reglas a), b), c)
+        UPDATE #lote SET motivo = 'Campos criticos nulos, vacios o no numericos'
+        WHERE motivo IS NULL
+          AND (anio IS NULL OR nro_mes IS NULL OR nro_mes NOT BETWEEN 1 AND 12
+               OR ubigeo IS NULL OR departamento IS NULL OR provincia IS NULL OR distrito IS NULL
+               OR sexo IS NULL OR etapa IS NULL OR grupo IS NULL OR detalle IS NULL
+               OR casos IS NULL OR casos < 1);
+
+        UPDATE #lote SET motivo = 'Ubigeo invalido (se esperan 6 digitos)'
+        WHERE motivo IS NULL AND dbo.fn_ubigeo_valido(ubigeo) = 0;
+
+        UPDATE #lote SET motivo = 'Sexo invalido (se espera F o M)'
+        WHERE motivo IS NULL AND sexo NOT IN ('F', 'M');
+
+        -- 3.3 Regla d): provincia / departamento dominante por prefijo de ubigeo
+        SELECT p4, provincia
+        INTO #prov_dom
+        FROM (SELECT LEFT(ubigeo, 4) AS p4, provincia,
+                     ROW_NUMBER() OVER (PARTITION BY LEFT(ubigeo, 4)
+                                        ORDER BY COUNT(*) DESC, provincia) AS rn
+              FROM #lote WHERE motivo IS NULL
+              GROUP BY LEFT(ubigeo, 4), provincia) x
+        WHERE rn = 1;
+
+        SELECT p2, departamento
+        INTO #dep_dom
+        FROM (SELECT LEFT(ubigeo, 2) AS p2, departamento,
+                     ROW_NUMBER() OVER (PARTITION BY LEFT(ubigeo, 2)
+                                        ORDER BY COUNT(*) DESC, departamento) AS rn
+              FROM #lote WHERE motivo IS NULL
+              GROUP BY LEFT(ubigeo, 2), departamento) x
+        WHERE rn = 1;
+
+        UPDATE l SET motivo = 'Provincia inconsistente con el prefijo del ubigeo (revisar fuente)'
+        FROM #lote l
+        WHERE l.motivo IS NULL
+          AND NOT EXISTS (SELECT 1 FROM #prov_dom d
+                          WHERE d.p4 = LEFT(l.ubigeo, 4) AND d.provincia = l.provincia);
+
+        UPDATE l SET motivo = 'Departamento inconsistente con el prefijo del ubigeo (revisar fuente)'
+        FROM #lote l
+        WHERE l.motivo IS NULL
+          AND NOT EXISTS (SELECT 1 FROM #dep_dom d
+                          WHERE d.p2 = LEFT(l.ubigeo, 2) AND d.departamento = l.departamento);
+
+        -- 3.4 Regla e): claves repetidas dentro del lote
+        SELECT id_fila,
+               CASE WHEN mn <> mx THEN 'Clave repetida con casos distintos (revisar fuente)'
+                    ELSE 'Duplicado exacto dentro del lote' END AS motivo
+        INTO #dups
+        FROM (SELECT id_fila,
+                     COUNT(*)   OVER (PARTITION BY anio, nro_mes, ubigeo, sexo, etapa, grupo, detalle) AS n,
+                     MIN(casos) OVER (PARTITION BY anio, nro_mes, ubigeo, sexo, etapa, grupo, detalle) AS mn,
+                     MAX(casos) OVER (PARTITION BY anio, nro_mes, ubigeo, sexo, etapa, grupo, detalle) AS mx,
+                     ROW_NUMBER() OVER (PARTITION BY anio, nro_mes, ubigeo, sexo, etapa, grupo, detalle
+                                        ORDER BY id_fila) AS rn
+              FROM #lote WHERE motivo IS NULL) k
+        WHERE n > 1 AND (mn <> mx OR rn > 1);
+
+        UPDATE l SET motivo = d.motivo
+        FROM #lote l JOIN #dups d ON d.id_fila = l.id_fila;
+
+        -- 3.5 Aplicar cambios en una sola transaccion
+        BEGIN TRANSACTION;
+
+        INSERT INTO dbo.tbl_cuarentena_tamizajes
+            (id_lote, id_fila_staging, Anio, NroMes, ubigeo, Departamento, Provincia, Distrito,
+             Sexo, Etapa, GrupoTamizaje, DetalleTamizaje, Casos, motivo_error)
+        SELECT @id_lote, s.id_fila, s.Anio, s.NroMes, s.ubigeo, s.Departamento, s.Provincia, s.Distrito,
+               s.Sexo, s.Etapa, s.GrupoTamizaje, s.DetalleTamizaje, s.Casos, l.motivo
+        FROM #lote l
+        JOIN stg.tamizajes_raw s ON s.id_fila = l.id_fila
+        WHERE l.motivo IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM dbo.tbl_cuarentena_tamizajes q
+                          WHERE q.id_lote = @id_lote AND q.id_fila_staging = l.id_fila);
+
+        INSERT INTO dbo.tbl_tamizajes_salud_mental_limpio
+            (anio, nro_mes, ubigeo, departamento, provincia, distrito, sexo, etapa,
+             grupo_tamizaje, detalle_tamizaje, casos, id_lote, id_fila_staging, orden_etapa)
+        SELECT l.anio, CAST(l.nro_mes AS TINYINT), l.ubigeo, l.departamento, l.provincia, l.distrito,
+               l.sexo, l.etapa, l.grupo, l.detalle, l.casos, @id_lote, l.id_fila,
+               dbo.fn_orden_etapa(l.etapa)
+        FROM #lote l
+        WHERE l.motivo IS NULL
+          AND NOT EXISTS (SELECT 1 FROM dbo.tbl_tamizajes_salud_mental_limpio t
+                          WHERE t.anio = l.anio AND t.nro_mes = l.nro_mes AND t.ubigeo = l.ubigeo
+                            AND t.sexo = l.sexo AND t.etapa = l.etapa
+                            AND t.grupo_tamizaje = l.grupo AND t.detalle_tamizaje = l.detalle);
+
+        -- Marcar (sin corregir) los positivos que superan al total de la misma combinacion
+        UPDATE p SET bandera_positivos_gt_total = 1
+        FROM dbo.tbl_tamizajes_salud_mental_limpio p
+        JOIN dbo.tbl_tamizajes_salud_mental_limpio t
+          ON  t.anio = p.anio AND t.nro_mes = p.nro_mes AND t.ubigeo = p.ubigeo
+          AND t.sexo = p.sexo AND t.etapa = p.etapa AND t.detalle_tamizaje = p.detalle_tamizaje
+          AND t.grupo_tamizaje = 'TOTAL DE TAMIZAJES'
+        WHERE p.grupo_tamizaje = 'SOLO TAMIZAJES POSITIVOS'
+          AND p.casos > t.casos
+          AND p.bandera_positivos_gt_total = 0;
+
+        -- 3.6 Cuadre y bitacora
+        DECLARE @f_stg INT, @c_stg BIGINT, @f_lim INT, @c_lim BIGINT, @f_cua INT, @c_cua BIGINT;
+
+        SELECT @f_stg = COUNT(*), @c_stg = SUM(CAST(ISNULL(casos, 0) AS BIGINT)) FROM #lote;
+        SELECT @f_lim = COUNT(*), @c_lim = SUM(CAST(casos AS BIGINT))
+          FROM dbo.tbl_tamizajes_salud_mental_limpio WHERE id_lote = @id_lote;
+        SELECT @f_cua = COUNT(*),
+               @c_cua = SUM(CAST(ISNULL(TRY_CAST(Casos AS INT), 0) AS BIGINT))
+          FROM dbo.tbl_cuarentena_tamizajes WHERE id_lote = @id_lote;
+
+        UPDATE dbo.tbl_bitacora_carga
+           SET filas_staging = @f_stg, casos_staging = @c_stg,
+               filas_limpias = @f_lim, casos_limpios = ISNULL(@c_lim, 0),
+               filas_cuarentena = @f_cua, casos_cuarentena = ISNULL(@c_cua, 0),
+               diferencia_filas = @f_stg - (@f_lim + @f_cua),
+               estado = CASE WHEN @f_stg = @f_lim + @f_cua THEN 'DEPURADO' ELSE 'DEPURADO_CON_DIFERENCIA' END,
+               mensaje = CASE WHEN @f_stg = @f_lim + @f_cua THEN mensaje
+                              ELSE N'Diferencia distinta de 0: hay filas del lote ya cargadas por otro lote.' END,
+               fecha_fin = SYSDATETIME()
+         WHERE id_lote = @id_lote;
+
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0 ROLLBACK TRANSACTION;
+
+        UPDATE dbo.tbl_bitacora_carga
+           SET estado = 'ERROR', fecha_fin = SYSDATETIME(), mensaje = LEFT(ERROR_MESSAGE(), 4000)
+         WHERE id_lote = @id_lote;
+
+        THROW;
+    END CATCH;
+END;
+GO
+
+-- ---------------------------------------------------------------------
+-- 4. Ejecucion y verificacion
+--    Reemplace @lote por el id_lote que devolvio el script 01.
+-- ---------------------------------------------------------------------
+-- DECLARE @lote INT = (SELECT MAX(id_lote) FROM dbo.tbl_bitacora_carga WHERE estado = 'CARGADO');
+-- EXEC dbo.usp_depurar_tamizajes @id_lote = @lote;
+-- SELECT * FROM dbo.tbl_bitacora_carga WHERE id_lote = @lote;
+-- SELECT motivo_error, COUNT(*) AS filas FROM dbo.tbl_cuarentena_tamizajes
+--  WHERE id_lote = @lote GROUP BY motivo_error;
+GO
