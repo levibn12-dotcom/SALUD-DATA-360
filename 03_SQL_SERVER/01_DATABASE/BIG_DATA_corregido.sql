@@ -4,15 +4,6 @@
    Orden: 0 Base y tablas -> 1 Funcion -> 2 Triggers -> 3 Procedimientos
           -> 4 Vistas -> 5 ETL del DW -> 6 Seguridad -> 7 Indice y metricas
           -> 8 Pruebas (evidencia) -> 9 Backup y restore
-
-   NOTAS IMPORTANTES
-   - Sin tildes a proposito, para evitar problemas de codificacion en SSMS.
-   - Este script NO fue ejecutado por quien lo redacto: pruebalo en tu servidor
-     y ajusta lo que tu motor indique (version, rutas, nombres de columnas).
-   - Asume que la tabla importada dbo.[DAT SALUD MENTAL - TAMIZAJE] existe con
-     las columnas que usaste (Anio, NroMes, ubigeo, Departamento, Provincia,
-     Distrito, Sexo, Etapa, GrupoTamizaje, DetalleTamizaje, Casos).
-   - La fecha se castea con TRY_CAST: formato recomendado AAAA-MM-DD.
    ===================================================================== */
 
 /* ---------------------------------------------------------------------
