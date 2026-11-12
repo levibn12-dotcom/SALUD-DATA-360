@@ -91,7 +91,7 @@ CREATE TABLE dbo.tbl_cuarentena_tamizajes (
 );
 GO
 
--- Tabla de log de auditoria (la exige la rubrica). La escriben triggers y procedimientos.
+-- Tabla de log de auditoria. La escriben triggers y procedimientos.
 IF OBJECT_ID('dbo.log_auditoria','U') IS NULL
 CREATE TABLE dbo.log_auditoria (
     id_log INT IDENTITY(1,1) PRIMARY KEY,
@@ -107,7 +107,7 @@ CREATE TABLE dbo.log_auditoria (
 );
 GO
 
--- Tabla de log del ETL (la exige la rubrica para el Data Warehouse)
+-- Tabla de log del ETL (Para el Data Warehouse)
 IF OBJECT_ID('dbo.etl_log','U') IS NULL
 CREATE TABLE dbo.etl_log (
     id_etl INT IDENTITY(1,1) PRIMARY KEY,
@@ -601,7 +601,7 @@ GO
 -- Copia de la pestana Messages: "logical reads" y "CPU time / elapsed time" antes vs despues.
 
 /* ---------------------------------------------------------------------
-   8. PRUEBAS Y EVIDENCIA (capturas para el informe y la sustentacion)
+   8. PRUEBAS Y EVIDENCIA
    --------------------------------------------------------------------- */
 -- 8.1 Funcion
 SELECT dbo.fn_grupo_etario(5) AS nino, dbo.fn_grupo_etario(15) AS adolescente,
