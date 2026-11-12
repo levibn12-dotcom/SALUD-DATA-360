@@ -12,10 +12,8 @@ Script completo y en orden de ejecucion de **DataSalud Peru - DIRESA La Libertad
           -> 4 Vistas -> 5 ETL del DW -> 6 Seguridad -> 7 Indice y metricas
           -> 8 Pruebas (evidencia) -> 9 Backup y restore
 
-   NOTAS IMPORTANTES
+   Informacion que hemos tomado en cuenta:
    - Sin tildes a proposito, para evitar problemas de codificacion en SSMS.
-   - Este script NO fue ejecutado por quien lo redacto: pruebalo en tu servidor
-     y ajusta lo que tu motor indique (version, rutas, nombres de columnas).
    - Asume que la tabla importada dbo.[DAT SALUD MENTAL - TAMIZAJE] existe con
      las columnas que usaste (Anio, NroMes, ubigeo, Departamento, Provincia,
      Distrito, Sexo, Etapa, GrupoTamizaje, DetalleTamizaje, Casos).
