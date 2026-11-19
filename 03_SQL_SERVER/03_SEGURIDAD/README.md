@@ -1,94 +1,107 @@
-# 03 - Seguridad (roles, permisos y vistas)
+# 03_SEGURIDAD - Roles y permisos
 
-Roles con minimo privilegio y segregacion de funciones: Administrador, Analista y Auditor. El analista solo accede a las vistas y al modelo dimensional, nunca a las tablas con detalle.
+Tres roles con el minimo de permisos y dos usuarios de prueba (sin login) para demostrar que cada rol queda bloqueado donde corresponde.
 
-## 1. Vistas analiticas
+## Archivos
+
+| Archivo | Que hace |
+|---|---|
+| `01_roles_y_permisos.sql` | Crea `Rol_Administrador`, `Rol_Analista` y `Rol_Auditor`, asigna `GRANT`/`DENY` y crea los usuarios `u_analista_test` y `u_auditor_test`. |
+| `02_pruebas_roles.sql` | Prueba con `EXECUTE AS USER` / `REVERT`: debe mostrar mensajes `OK bloqueado` donde el rol no tiene permiso. |
+
+## Que puede hacer cada rol
+
+| Rol | Puede | No puede |
+|---|---|---|
+| `Rol_Administrador` | Usar y modificar todo, ejecutar procedimientos | Modificar o borrar `log_auditoria` |
+| `Rol_Analista` | `SELECT` en vistas, warehouse (`dw`) y tablas del modelo final | Ver la tabla de origen, cuarentena, `log_auditoria` ni `etl_log` |
+| `Rol_Auditor` | `SELECT` en `log_auditoria`, `etl_log` y cuarentena | Modificar nada; leer la tabla de hechos |
+
+## Codigo
+
+### `01_roles_y_permisos.sql`
+
+Crea `Rol_Administrador`, `Rol_Analista` y `Rol_Auditor`, asigna `GRANT`/`DENY` y crea los usuarios `u_analista_test` y `u_auditor_test`.
 
 ```sql
-/* ---------------------------------------------------------------------
-   4. VISTAS ANALITICAS (el analista solo vera estas, no las tablas base)
-   --------------------------------------------------------------------- */
-CREATE OR ALTER VIEW dbo.vw_tamizajes_por_provincia AS
-SELECT provincia, etapa, SUM(casos) AS TotalCasos
-FROM dbo.tbl_tamizajes_salud_mental_limpio
-WHERE provincia IS NOT NULL AND provincia <> ''
-GROUP BY provincia, etapa;
-GO
-CREATE OR ALTER VIEW dbo.vw_tamizajes_tendencia_temporal AS
-SELECT anio, nro_mes, SUM(casos) AS TotalCasosMensuales
-FROM dbo.tbl_tamizajes_salud_mental_limpio
-GROUP BY anio, nro_mes;
-GO
-```
+-- 03_SEGURIDAD/01_roles_y_permisos.sql
 
-## 2. Roles, permisos y usuarios de prueba
-
-```sql
-/* ---------------------------------------------------------------------
-   6. SEGURIDAD: roles con minimo privilegio y segregacion de funciones
-   Las vistas y procedimientos pertenecen a dbo, por lo que el encadenamiento de propiedad
-   permite al analista leer las vistas sin tener acceso a las tablas base.
-   --------------------------------------------------------------------- */
-IF DATABASE_PRINCIPAL_ID('Rol_Administrador_Salud') IS NULL CREATE ROLE Rol_Administrador_Salud;
-IF DATABASE_PRINCIPAL_ID('Rol_Analista_Datos') IS NULL CREATE ROLE Rol_Analista_Datos;
-IF DATABASE_PRINCIPAL_ID('Rol_Auditor') IS NULL CREATE ROLE Rol_Auditor;
+USE BD_DataSalud_Atenciones;
 GO
 
--- Se retiran los permisos amplios del script original
-REVOKE CONTROL ON DATABASE::BD_DataSalud_LaLibertad FROM Rol_Administrador_Salud;
-REVOKE SELECT ON dbo.tbl_tamizajes_salud_mental_limpio FROM Rol_Analista_Datos;
-REVOKE SELECT ON dbo.tbl_tamizajes_salud_mental_limpio FROM Rol_Auditor;
+-- 6. SEGURIDAD (roles con el minimo de permisos)
+IF DATABASE_PRINCIPAL_ID('Rol_Administrador') IS NULL CREATE ROLE Rol_Administrador;
+IF DATABASE_PRINCIPAL_ID('Rol_Analista')      IS NULL CREATE ROLE Rol_Analista;
+IF DATABASE_PRINCIPAL_ID('Rol_Auditor')       IS NULL CREATE ROLE Rol_Auditor;
 GO
 
--- Administrador: opera y mantiene, pero NO puede alterar el log de auditoria
-ALTER ROLE db_ddladmin ADD MEMBER Rol_Administrador_Salud;
-GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE ON SCHEMA::dbo TO Rol_Administrador_Salud;
-DENY INSERT, UPDATE, DELETE ON dbo.log_auditoria TO Rol_Administrador_Salud;
+-- Administrador: usa todo, pero NO puede modificar ni borrar el log de auditoria
+-- (los triggers siguen pudiendo escribir en el log porque son de dbo)
+ALTER ROLE db_ddladmin ADD MEMBER Rol_Administrador;
+GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE ON SCHEMA::dbo TO Rol_Administrador;
+GRANT SELECT, INSERT, UPDATE, DELETE ON SCHEMA::dw TO Rol_Administrador;
+DENY INSERT, UPDATE, DELETE ON dbo.log_auditoria TO Rol_Administrador;
 GO
 
--- Analista: solo vistas y modelo dimensional; sin acceso a tablas con detalle ni a logs
-GRANT SELECT ON dbo.vw_tamizajes_por_provincia TO Rol_Analista_Datos;
-GRANT SELECT ON dbo.vw_tamizajes_tendencia_temporal TO Rol_Analista_Datos;
-GRANT SELECT ON dbo.Dim_Ubicacion TO Rol_Analista_Datos;
-GRANT SELECT ON dbo.Dim_Tiempo TO Rol_Analista_Datos;
-GRANT SELECT ON dbo.Dim_Perfil TO Rol_Analista_Datos;
-GRANT SELECT ON dbo.Fact_Tamizajes TO Rol_Analista_Datos;
-DENY SELECT ON dbo.tbl_atenciones_salud_mental TO Rol_Analista_Datos;
-DENY SELECT ON dbo.staging_atenciones_mental TO Rol_Analista_Datos;
-DENY SELECT ON dbo.tbl_cuarentena_atenciones TO Rol_Analista_Datos;
-DENY SELECT ON dbo.tbl_cuarentena_tamizajes TO Rol_Analista_Datos;
-DENY SELECT ON dbo.log_auditoria TO Rol_Analista_Datos;
+-- Analista: solo SELECT en vistas, warehouse y tablas del modelo final
+GRANT SELECT ON dbo.vw_total_por_ubicacion_diagnostico TO Rol_Analista;
+GRANT SELECT ON dbo.vw_evolucion_mensual TO Rol_Analista;
+GRANT SELECT ON dbo.vw_por_sexo_etapa_diagnostico TO Rol_Analista;
+GRANT SELECT ON SCHEMA::dw TO Rol_Analista;
+GRANT SELECT ON dbo.Ubicacion TO Rol_Analista;
+GRANT SELECT ON dbo.Genero TO Rol_Analista;
+GRANT SELECT ON dbo.Rango_Edad TO Rol_Analista;
+GRANT SELECT ON dbo.Diagnostico TO Rol_Analista;
+GRANT SELECT ON dbo.Atencion_Diagnostico TO Rol_Analista;
+DENY SELECT ON dbo.origen_atenciones_diagnostico TO Rol_Analista;
+DENY SELECT ON dbo.tbl_cuarentena_atenciones TO Rol_Analista;
+DENY SELECT ON dbo.log_auditoria TO Rol_Analista;
+DENY SELECT ON dbo.etl_log TO Rol_Analista;
 GO
 
--- Auditor: solo lectura de log, cuarentena y log del ETL; no modifica nada
+-- Auditor: solo lee log, etl_log y cuarentena; no modifica nada
 GRANT SELECT ON dbo.log_auditoria TO Rol_Auditor;
 GRANT SELECT ON dbo.etl_log TO Rol_Auditor;
 GRANT SELECT ON dbo.tbl_cuarentena_atenciones TO Rol_Auditor;
-GRANT SELECT ON dbo.tbl_cuarentena_tamizajes TO Rol_Auditor;
 DENY INSERT, UPDATE, DELETE ON SCHEMA::dbo TO Rol_Auditor;
 GO
 
--- Usuarios de prueba (sin login) para demostrar que cada rol falla donde debe
+-- Usuarios de prueba sin login (sirven solo para demostrar los permisos)
 IF DATABASE_PRINCIPAL_ID('u_analista_test') IS NULL CREATE USER u_analista_test WITHOUT LOGIN;
-IF DATABASE_PRINCIPAL_ID('u_auditor_test') IS NULL CREATE USER u_auditor_test WITHOUT LOGIN;
-ALTER ROLE Rol_Analista_Datos ADD MEMBER u_analista_test;
-ALTER ROLE Rol_Auditor ADD MEMBER u_auditor_test;
+IF DATABASE_PRINCIPAL_ID('u_auditor_test')  IS NULL CREATE USER u_auditor_test WITHOUT LOGIN;
+ALTER ROLE Rol_Analista ADD MEMBER u_analista_test;
+ALTER ROLE Rol_Auditor  ADD MEMBER u_auditor_test;
 GO
 ```
 
-## 3. Pruebas de roles (evidencia)
+### `02_pruebas_roles.sql`
+
+Prueba con `EXECUTE AS USER` / `REVERT`: debe mostrar mensajes `OK bloqueado` donde el rol no tiene permiso.
 
 ```sql
--- 8.6 Roles: cada prueba debe mostrar "OK bloqueado" donde corresponde
+-- 03_SEGURIDAD/02_pruebas_roles.sql
+
+USE BD_DataSalud_Atenciones;
+GO
+
+-- 8.7 Roles: cada prueba debe mostrar "OK bloqueado" donde corresponde
 EXECUTE AS USER = 'u_analista_test';
 BEGIN TRY
-    SELECT TOP 1 * FROM dbo.tbl_atenciones_salud_mental;
-    PRINT 'FALLO: el analista pudo leer la tabla base.';
+    SELECT TOP 1 * FROM dbo.origen_atenciones_diagnostico;
+    PRINT 'FALLO: el analista pudo leer la tabla de origen.';
 END TRY
 BEGIN CATCH
-    PRINT CONCAT('OK bloqueado (analista -> tabla base): ', ERROR_MESSAGE());
+    PRINT CONCAT('OK bloqueado (analista -> origen): ', ERROR_MESSAGE());
 END CATCH;
-SELECT TOP 5 * FROM dbo.vw_tamizajes_por_provincia;   -- esto SI debe funcionar
+BEGIN TRY
+    SELECT TOP 1 * FROM dbo.log_auditoria;
+    PRINT 'FALLO: el analista pudo leer el log.';
+END TRY
+BEGIN CATCH
+    PRINT CONCAT('OK bloqueado (analista -> log_auditoria): ', ERROR_MESSAGE());
+END CATCH;
+SELECT TOP 5 * FROM dbo.vw_evolucion_mensual;   -- esto SI debe funcionar
+SELECT TOP 5 * FROM dw.Resumen_Ubicacion;       -- esto SI debe funcionar
 REVERT;
 
 EXECUTE AS USER = 'u_auditor_test';
@@ -98,6 +111,13 @@ BEGIN TRY
 END TRY
 BEGIN CATCH
     PRINT CONCAT('OK bloqueado (auditor -> borrar log): ', ERROR_MESSAGE());
+END CATCH;
+BEGIN TRY
+    SELECT TOP 1 * FROM dbo.Atencion_Diagnostico;
+    PRINT 'FALLO: el auditor pudo leer la tabla de hechos.';
+END TRY
+BEGIN CATCH
+    PRINT CONCAT('OK bloqueado (auditor -> tabla de hechos): ', ERROR_MESSAGE());
 END CATCH;
 SELECT TOP 5 * FROM dbo.log_auditoria ORDER BY id_log DESC;   -- esto SI debe funcionar
 REVERT;
