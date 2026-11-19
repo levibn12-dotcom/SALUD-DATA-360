@@ -1,95 +1,159 @@
-# 04 - Auditoria (log y triggers)
+# 04_AUDITORIA - Triggers y registros
 
-Trazabilidad: tabla `log_auditoria` y triggers DML (auditoria de INSERT/UPDATE/DELETE e integridad). Los procedimientos de ingesta tambien escriben en este log.
+Dos triggers sobre `Atencion_Diagnostico`: uno **registra** quien cambio que (valor anterior y nuevo) y otro **bloquea** datos invalidos. Las tablas `log_auditoria` y `etl_log` se crean en `01_DATABASE`.
 
-## 1. Tabla de log de auditoria
+## Archivos
+
+| Archivo | Que hace |
+|---|---|
+| `01_trigger_auditoria.sql` | `trg_audit_atencion_diagnostico`: despues de cada `INSERT`, `UPDATE` o `DELETE` guarda en `log_auditoria` el usuario, la operacion y los valores anterior y nuevo. |
+| `02_trigger_validacion.sql` | `trg_validar_atencion_diagnostico`: cancela la operacion si `nro_mes` no esta entre 1 y 12 o si `atendidos`/`atenciones` son negativos. |
+| `03_pruebas_triggers.sql` | Un `UPDATE` que debe dejar registro en el log, y dos `INSERT` (mes 15 y atendidos -5) que deben ser bloqueados. Ejecutar despues de `02_AUTOMATIZACION/06_pruebas_carga.sql` (necesita datos). |
+| `04_consultas_auditoria.sql` | Consultas para revisar la auditoria, el log del ETL, la cuarentena y las cargas por lote. |
+
+## Codigo
+
+### `01_trigger_auditoria.sql`
+
+`trg_audit_atencion_diagnostico`: despues de cada `INSERT`, `UPDATE` o `DELETE` guarda en `log_auditoria` el usuario, la operacion y los valores anterior y nuevo.
 
 ```sql
--- Tabla de log de auditoria (la exige la rubrica). La escriben triggers y procedimientos.
-IF OBJECT_ID('dbo.log_auditoria','U') IS NULL
-CREATE TABLE dbo.log_auditoria (
-    id_log INT IDENTITY(1,1) PRIMARY KEY,
-    tabla VARCHAR(100) NOT NULL,
-    operacion VARCHAR(20) NOT NULL,      -- INSERT, UPDATE, DELETE, INGESTA, ERROR
-    registro_id INT NULL,
-    usuario VARCHAR(128) NOT NULL DEFAULT SUSER_SNAME(),
-    fecha_hora DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
-    valor_anterior VARCHAR(MAX) NULL,
-    valor_nuevo VARCHAR(MAX) NULL,
-    lote_id VARCHAR(50) NULL,
-    detalle VARCHAR(1000) NULL
-);
+-- 04_AUDITORIA/01_trigger_auditoria.sql
+
+USE BD_DataSalud_Atenciones;
 GO
-```
 
-## 2. Triggers
-
-```sql
-/* ---------------------------------------------------------------------
-   2. TRIGGERS
-   2.1 Auditoria DML: registra quien, cuando y los valores antes/despues.
-       Si falla el log, falla la operacion (no se pierde trazabilidad).
-   --------------------------------------------------------------------- */
-CREATE OR ALTER TRIGGER dbo.trg_audit_atenciones
-ON dbo.tbl_atenciones_salud_mental
+-- 2. TRIGGERS (2.1 auditoria: quien, que, valor anterior y nuevo)
+CREATE OR ALTER TRIGGER dbo.trg_audit_atencion_diagnostico
+ON dbo.Atencion_Diagnostico
 AFTER INSERT, UPDATE, DELETE
 AS
 BEGIN
     SET NOCOUNT ON;
     INSERT INTO dbo.log_auditoria (tabla, operacion, registro_id, valor_anterior, valor_nuevo)
     SELECT
-        'tbl_atenciones_salud_mental',
-        CASE WHEN i.id_atencion IS NOT NULL AND d.id_atencion IS NULL THEN 'INSERT'
-             WHEN i.id_atencion IS NOT NULL AND d.id_atencion IS NOT NULL THEN 'UPDATE'
+        'Atencion_Diagnostico',
+        -- si solo esta en "inserted" es INSERT; en las dos es UPDATE; si solo en "deleted" es DELETE
+        CASE WHEN i.id_atencion_diagnostico IS NOT NULL AND d.id_atencion_diagnostico IS NULL THEN 'INSERT'
+             WHEN i.id_atencion_diagnostico IS NOT NULL AND d.id_atencion_diagnostico IS NOT NULL THEN 'UPDATE'
              ELSE 'DELETE' END,
-        COALESCE(i.id_atencion, d.id_atencion),
-        CASE WHEN d.id_atencion IS NULL THEN NULL ELSE
-            CONCAT('est=', d.co_establecimiento, '; fecha=', d.fecha_atencion, '; edad=', d.edad,
-                   '; sexo=', d.sexo, '; diag=', d.diagnostico) END,
-        CASE WHEN i.id_atencion IS NULL THEN NULL ELSE
-            CONCAT('est=', i.co_establecimiento, '; fecha=', i.fecha_atencion, '; edad=', i.edad,
-                   '; sexo=', i.sexo, '; diag=', i.diagnostico) END
+        COALESCE(i.id_atencion_diagnostico, d.id_atencion_diagnostico),
+        CASE WHEN d.id_atencion_diagnostico IS NULL THEN NULL ELSE
+            CONCAT('anio=', d.anio, '; mes=', d.nro_mes, '; atendidos=', d.atendidos,
+                   '; atenciones=', d.atenciones) END,
+        CASE WHEN i.id_atencion_diagnostico IS NULL THEN NULL ELSE
+            CONCAT('anio=', i.anio, '; mes=', i.nro_mes, '; atendidos=', i.atendidos,
+                   '; atenciones=', i.atenciones) END
     FROM inserted i
-    FULL OUTER JOIN deleted d ON i.id_atencion = d.id_atencion;
+    FULL OUTER JOIN deleted d ON i.id_atencion_diagnostico = d.id_atencion_diagnostico;
 END;
 GO
+```
 
--- 2.2 Integridad: rechaza edades fuera de rango, fechas futuras y diagnostico vacio
-CREATE OR ALTER TRIGGER dbo.trg_integridad_atenciones
-ON dbo.tbl_atenciones_salud_mental
+### `02_trigger_validacion.sql`
+
+`trg_validar_atencion_diagnostico`: cancela la operacion si `nro_mes` no esta entre 1 y 12 o si `atendidos`/`atenciones` son negativos.
+
+```sql
+-- 04_AUDITORIA/02_trigger_validacion.sql
+
+USE BD_DataSalud_Atenciones;
+GO
+
+-- 2.2 Validacion: bloquea mes fuera de 1-12 y numeros negativos
+CREATE OR ALTER TRIGGER dbo.trg_validar_atencion_diagnostico
+ON dbo.Atencion_Diagnostico
 AFTER INSERT, UPDATE
 AS
 BEGIN
     SET NOCOUNT ON;
     IF EXISTS (SELECT 1 FROM inserted
-               WHERE edad < 0 OR edad > 120
-                  OR fecha_atencion > CAST(GETDATE() AS DATE)
-                  OR LTRIM(RTRIM(diagnostico)) = '')
+               WHERE nro_mes NOT BETWEEN 1 AND 12
+                  OR atendidos < 0
+                  OR atenciones < 0)
     BEGIN
-        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
-        THROW 50001, 'Integridad: edad fuera de 0-120, fecha futura o diagnostico vacio. Operacion revertida.', 1;
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;   -- cancela la operacion
+        THROW 50001, 'Validacion: nro_mes debe estar entre 1 y 12 y atendidos/atenciones no pueden ser negativos. Operacion cancelada.', 1;
     END
 END;
 GO
 ```
 
-## 3. Pruebas de triggers (evidencia)
+### `03_pruebas_triggers.sql`
+
+Un `UPDATE` que debe dejar registro en el log, y dos `INSERT` (mes 15 y atendidos -5) que deben ser bloqueados. Ejecutar despues de `02_AUTOMATIZACION/06_pruebas_carga.sql` (necesita datos).
 
 ```sql
--- 8.3 Trigger de auditoria: un UPDATE genera registro con valor anterior y nuevo
-UPDATE dbo.tbl_atenciones_salud_mental SET diagnostico = 'F32.1 Depresion moderada' WHERE co_establecimiento = '0001';
+-- 04_AUDITORIA/03_pruebas_triggers.sql
+
+USE BD_DataSalud_Atenciones;
+GO
+
+-- 8.3 Trigger de auditoria: un UPDATE deja registro con valor anterior y nuevo
+UPDATE dbo.Atencion_Diagnostico
+SET atenciones = 3
+WHERE id_atencion_diagnostico = (SELECT MIN(id_atencion_diagnostico) FROM dbo.Atencion_Diagnostico);
 SELECT TOP 10 * FROM dbo.log_auditoria ORDER BY id_log DESC;
 GO
 
--- 8.4 Trigger de integridad: debe rechazar y revertir (edad 200)
+-- 8.4 Trigger de validacion: debe bloquear mes 15 y atendidos -5
+DECLARE @u INT = (SELECT TOP 1 id_ubicacion FROM dbo.Ubicacion ORDER BY id_ubicacion);
+DECLARE @g INT = (SELECT TOP 1 id_genero FROM dbo.Genero ORDER BY id_genero);
+DECLARE @e INT = (SELECT TOP 1 id_rango_edad FROM dbo.Rango_Edad ORDER BY id_rango_edad);
+DECLARE @d INT = (SELECT TOP 1 id_diagnostico FROM dbo.Diagnostico ORDER BY id_diagnostico);
+
 BEGIN TRY
-    INSERT INTO dbo.tbl_atenciones_salud_mental (co_establecimiento, fecha_atencion, edad, sexo, diagnostico)
-    VALUES ('0009', '2024-01-01', 200, 'M', 'F41');
-    PRINT 'FALLO: el trigger no rechazo la fila.';
+    INSERT INTO dbo.Atencion_Diagnostico (id_ubicacion, id_genero, id_rango_edad, id_diagnostico, anio, nro_mes, atendidos, atenciones)
+    VALUES (@u, @g, @e, @d, 2030, 15, 1, 1);
+    PRINT 'FALLO: el trigger no bloqueo el mes 15.';
 END TRY
 BEGIN CATCH
-    PRINT CONCAT('OK, rechazado por el trigger: ', ERROR_MESSAGE());
+    PRINT CONCAT('OK, bloqueado (mes 15): ', ERROR_MESSAGE());
+END CATCH;
+
+BEGIN TRY
+    INSERT INTO dbo.Atencion_Diagnostico (id_ubicacion, id_genero, id_rango_edad, id_diagnostico, anio, nro_mes, atendidos, atenciones)
+    VALUES (@u, @g, @e, @d, 2030, 1, -5, 1);
+    PRINT 'FALLO: el trigger no bloqueo atendidos negativo.';
+END TRY
+BEGIN CATCH
+    PRINT CONCAT('OK, bloqueado (atendidos -5): ', ERROR_MESSAGE());
 END CATCH;
 GO
 ```
 
+### `04_consultas_auditoria.sql`
+
+Consultas para revisar la auditoria, el log del ETL, la cuarentena y las cargas por lote.
+
+```sql
+-- 04_AUDITORIA/04_consultas_auditoria.sql
+
+USE BD_DataSalud_Atenciones;
+GO
+
+-- Consultas para revisar la auditoria, el ETL y la cuarentena
+SELECT TOP 20 * FROM dbo.log_auditoria ORDER BY id_log DESC;
+
+-- Cuantas operaciones de cada tipo hay y quien las hizo
+SELECT usuario, operacion, COUNT(*) AS veces
+FROM dbo.log_auditoria
+GROUP BY usuario, operacion
+ORDER BY veces DESC;
+
+-- Resultado de cada paso del ETL (lectura, cuarentena, catalogos, hechos, cuadre, warehouse)
+SELECT TOP 20 * FROM dbo.etl_log ORDER BY id_etl DESC;
+
+-- Filas rechazadas por motivo
+SELECT motivo_error, COUNT(*) AS filas
+FROM dbo.tbl_cuarentena_atenciones
+GROUP BY motivo_error
+ORDER BY filas DESC;
+
+-- Filas y totales cargados por lote
+SELECT lote_id, COUNT(*) AS filas, SUM(atendidos) AS atendidos, SUM(atenciones) AS atenciones
+FROM dbo.Atencion_Diagnostico
+GROUP BY lote_id
+ORDER BY lote_id;
+GO
+```
