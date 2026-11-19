@@ -1,736 +1,399 @@
-# 01 - Base de datos (script completo)
+# 01_DATABASE - Estructura de la base de datos
 
-Script completo y en orden de ejecucion de **DataSalud Peru - DIRESA La Libertad** (CIIN1021P). Incluye base, tablas, funcion, triggers, procedimientos, vistas, ETL, seguridad, indice, pruebas y backups. Tambien puedes descargar el archivo `BIG_DATA_corregido.sql` de esta misma carpeta.
+Crea la base `BD_DataSalud_Atenciones` con sus tablas, funciones, vistas y las tablas del warehouse. Es lo primero que se ejecuta.
 
-## Script completo
+## Archivos
+
+| Archivo | Que hace |
+|---|---|
+| `01_crear_base_y_tablas.sql` | Crea la base y las 9 tablas: la de **hechos** (`Atencion_Diagnostico`), los 4 **catalogos** (`Ubicacion`, `Genero`, `Rango_Edad`, `Diagnostico`) y las de **apoyo** (`origen_atenciones_diagnostico`, `tbl_cuarentena_atenciones`, `log_auditoria`, `etl_log`). Todas con `PRIMARY KEY`; la de hechos tambien con `FOREIGN KEY` y `UNIQUE`. |
+| `02_funciones.sql` | Dos funciones: `fn_promedio_atenciones` (atenciones por persona atendida, sin dividir entre cero) y `fn_etiqueta_seguimiento` (texto segun si hubo seguimiento). |
+| `03_vistas.sql` | Tres vistas para el analista: totales por ubicacion y diagnostico, evolucion mensual, y por sexo/etapa/diagnostico. |
+| `04_warehouse_tablas.sql` | Esquema `dw` y las 3 tablas resumen que se llevan a Power BI (se llenan con `02_AUTOMATIZACION/04_warehouse_carga.sql`). |
+| `05_prueba_funciones.sql` | Prueba rapida de las dos funciones. |
+| `06_consultas_informe.sql` | Consultas listas para el informe, sobre las tablas del warehouse. Ejecutar despues de importar los datos y cargar el warehouse. |
+
+## Tablas del warehouse (esquema `dw`)
+
+| Tabla | Para que sirve | En Power BI |
+|---|---|---|
+| `dw.Resumen_Tiempo_Diagnostico` | Como evoluciona cada tipo de caso mes a mes | Lineas o columnas por anio/mes |
+| `dw.Resumen_Ubicacion` | Donde se concentran los casos (departamento y provincia) | Mapa o barras |
+| `dw.Resumen_Perfil` | A quienes afecta (sexo y etapa de vida) | Barras |
+
+## Llevar los datos a Power BI
+
+Power BI Desktop > Obtener datos > SQL Server > servidor de SSMS (por ejemplo `localhost` o `.\SQLEXPRESS`) > base `BD_DataSalud_Atenciones` > marcar las 3 tablas del esquema `dw` > Cargar.
+
+## Codigo
+
+### `01_crear_base_y_tablas.sql`
+
+Crea la base y las 9 tablas: la de **hechos** (`Atencion_Diagnostico`), los 4 **catalogos** (`Ubicacion`, `Genero`, `Rango_Edad`, `Diagnostico`) y las de **apoyo** (`origen_atenciones_diagnostico`, `tbl_cuarentena_atenciones`, `log_auditoria`, `etl_log`). Todas con `PRIMARY KEY`; la de hechos tambien con `FOREIGN KEY` y `UNIQUE`.
 
 ```sql
-/* =====================================================================
-   DataSalud Peru - DIRESA La Libertad  |  CIIN1021P
-   Script corregido y completo. Ejecutar de arriba hacia abajo, por bloques (GO).
-   Orden: 0 Base y tablas -> 1 Funcion -> 2 Triggers -> 3 Procedimientos
-          -> 4 Vistas -> 5 ETL del DW -> 6 Seguridad -> 7 Indice y metricas
-          -> 8 Pruebas (evidencia) -> 9 Backup y restore
+-- 01_DATABASE/01_crear_base_y_tablas.sql
 
-   Informacion que hemos tomado en cuenta:
-   - Sin tildes a proposito, para evitar problemas de codificacion en SSMS.
-   - Asume que la tabla importada dbo.[DAT SALUD MENTAL - TAMIZAJE] existe con
-     las columnas que usaste (Anio, NroMes, ubigeo, Departamento, Provincia,
-     Distrito, Sexo, Etapa, GrupoTamizaje, DetalleTamizaje, Casos).
-   - La fecha se castea con TRY_CAST: formato recomendado AAAA-MM-DD.
-   ===================================================================== */
-
-/* ---------------------------------------------------------------------
-   0. BASE DE DATOS Y TABLAS (idempotente: se puede ejecutar mas de una vez)
-   --------------------------------------------------------------------- */
-IF DB_ID('BD_DataSalud_LaLibertad') IS NULL CREATE DATABASE BD_DataSalud_LaLibertad;
+-- 0. BASE DE DATOS Y TABLAS
+IF DB_ID('BD_DataSalud_Atenciones') IS NULL CREATE DATABASE BD_DataSalud_Atenciones;
 GO
-USE BD_DataSalud_LaLibertad;
+USE BD_DataSalud_Atenciones;   -- USE = pone en uso esa base de datos
 GO
 
-IF OBJECT_ID('dbo.staging_atenciones_mental','U') IS NULL
-CREATE TABLE dbo.staging_atenciones_mental (
-    id_staging INT IDENTITY(1,1) PRIMARY KEY,
-    Co_Establecimiento VARCHAR(50),
-    Nom_Establecimiento VARCHAR(255),
-    Fecha_Atencion VARCHAR(50),
-    Edad VARCHAR(50),
-    Sexo VARCHAR(20),
-    Diagnostico VARCHAR(100),
-    Ubigeo VARCHAR(10)
-);
-GO
--- Si tu staging ya existia con Sexo VARCHAR(10), ampliarlo para valores como 'Femenino'
-ALTER TABLE dbo.staging_atenciones_mental ALTER COLUMN Sexo VARCHAR(20);
-GO
-
-IF OBJECT_ID('dbo.tbl_atenciones_salud_mental','U') IS NULL
-CREATE TABLE dbo.tbl_atenciones_salud_mental (
-    id_atencion INT IDENTITY(1,1) PRIMARY KEY,
-    co_establecimiento VARCHAR(50) NOT NULL,
-    nom_establecimiento VARCHAR(255),
-    fecha_atencion DATE NOT NULL,
-    edad INT CHECK (edad >= 0 AND edad <= 120),
-    sexo CHAR(1),
-    diagnostico VARCHAR(100) NOT NULL,
-    ubigeo VARCHAR(10),
-    fecha_carga DATETIME DEFAULT GETDATE()
+-- ---- TABLA DE APOYO 1: ORIGEN (sala de espera) ----
+-- Recibe el CSV tal cual viene, todo como texto (VARCHAR), asi la carga nunca falla.
+-- Luego usp_cargar_atenciones la revisa y pasa solo lo bueno al modelo.
+-- Se vacia antes de cada archivo nuevo (usp_limpiar_origen).
+IF OBJECT_ID('dbo.origen_atenciones_diagnostico','U') IS NULL
+CREATE TABLE dbo.origen_atenciones_diagnostico (
+    id_origen    INT IDENTITY(1,1) NOT NULL,   -- numero que SQL Server asigna solo (1, 2, 3...)
+    Anio         VARCHAR(50),
+    NroMes       VARCHAR(50),
+    ubigeo       VARCHAR(50),
+    Departamento VARCHAR(100),
+    Provincia    VARCHAR(100),
+    Distrito     VARCHAR(100),
+    Sexo         VARCHAR(50),
+    Etapa        VARCHAR(50),
+    Diagnostico  VARCHAR(100),
+    Atendidos    VARCHAR(50),
+    Atenciones   VARCHAR(50),
+    CONSTRAINT PK_Origen_Atenciones PRIMARY KEY (id_origen)   -- llave primaria
 );
 GO
 
+-- ---- CATALOGO 1: donde ocurrio la atencion ----
+IF OBJECT_ID('dbo.Ubicacion','U') IS NULL
+CREATE TABLE dbo.Ubicacion (
+    id_ubicacion INT IDENTITY(1,1) NOT NULL,
+    ubigeo       VARCHAR(20)  NOT NULL,
+    departamento VARCHAR(100) NOT NULL,
+    provincia    VARCHAR(100) NOT NULL,
+    distrito     VARCHAR(100) NOT NULL,
+    CONSTRAINT PK_Ubicacion PRIMARY KEY (id_ubicacion),
+    CONSTRAINT UQ_Ubicacion UNIQUE (ubigeo, departamento, provincia, distrito)
+);
+GO
+
+-- ---- CATALOGO 2: sexo ('F', 'M' o 'No registrado') ----
+IF OBJECT_ID('dbo.Genero','U') IS NULL
+CREATE TABLE dbo.Genero (
+    id_genero INT IDENTITY(1,1) NOT NULL,
+    sexo      VARCHAR(20) NOT NULL,
+    CONSTRAINT PK_Genero PRIMARY KEY (id_genero),
+    CONSTRAINT UQ_Genero UNIQUE (sexo)
+);
+GO
+
+-- ---- CATALOGO 3: etapa de vida ('1 - 4', '5 - 9', ...) ----
+IF OBJECT_ID('dbo.Rango_Edad','U') IS NULL
+CREATE TABLE dbo.Rango_Edad (
+    id_rango_edad INT IDENTITY(1,1) NOT NULL,
+    etapa         VARCHAR(50) NOT NULL,
+    CONSTRAINT PK_Rango_Edad PRIMARY KEY (id_rango_edad),
+    CONSTRAINT UQ_Rango_Edad UNIQUE (etapa)
+);
+GO
+
+-- ---- CATALOGO 4: tipo de diagnostico ----
+IF OBJECT_ID('dbo.Diagnostico','U') IS NULL
+CREATE TABLE dbo.Diagnostico (
+    id_diagnostico INT IDENTITY(1,1) NOT NULL,
+    diagnostico    VARCHAR(100) NOT NULL,
+    CONSTRAINT PK_Diagnostico PRIMARY KEY (id_diagnostico),
+    CONSTRAINT UQ_Diagnostico UNIQUE (diagnostico)
+);
+GO
+
+-- ---- TABLA PRINCIPAL (hechos): une los 4 catalogos con FOREIGN KEY ----
+-- lote_id dice de que carga viene cada fila (sirve para cuadrar sumas).
+IF OBJECT_ID('dbo.Atencion_Diagnostico','U') IS NULL
+CREATE TABLE dbo.Atencion_Diagnostico (
+    id_atencion_diagnostico INT IDENTITY(1,1) NOT NULL,
+    id_ubicacion   INT NOT NULL,
+    id_genero      INT NOT NULL,
+    id_rango_edad  INT NOT NULL,
+    id_diagnostico INT NOT NULL,
+    anio       SMALLINT NOT NULL,
+    nro_mes    TINYINT  NOT NULL,
+    atendidos  INT NOT NULL,
+    atenciones INT NOT NULL,
+    fecha_carga DATETIME NOT NULL DEFAULT GETDATE(),   -- fecha automatica
+    lote_id    VARCHAR(50) NULL,
+    CONSTRAINT PK_Atencion_Diagnostico PRIMARY KEY (id_atencion_diagnostico),
+    CONSTRAINT FK_Atencion_Ubicacion   FOREIGN KEY (id_ubicacion)   REFERENCES dbo.Ubicacion(id_ubicacion),
+    CONSTRAINT FK_Atencion_Genero      FOREIGN KEY (id_genero)      REFERENCES dbo.Genero(id_genero),
+    CONSTRAINT FK_Atencion_RangoEdad   FOREIGN KEY (id_rango_edad)  REFERENCES dbo.Rango_Edad(id_rango_edad),
+    CONSTRAINT FK_Atencion_Diagnostico FOREIGN KEY (id_diagnostico) REFERENCES dbo.Diagnostico(id_diagnostico),
+    -- una misma combinacion no puede repetirse
+    CONSTRAINT UQ_Atencion_Diagnostico UNIQUE
+        (id_ubicacion, id_genero, id_rango_edad, id_diagnostico, anio, nro_mes)
+);
+GO
+
+-- ---- TABLA DE APOYO 2: CUARENTENA (filas rechazadas) ----
+-- Aqui caen las filas con errores (mes 15, numeros negativos, vacios) o repetidas,
+-- con el motivo escrito. Sirve para saber que corregir en el Excel. Todo en texto, tal como llego.
 IF OBJECT_ID('dbo.tbl_cuarentena_atenciones','U') IS NULL
 CREATE TABLE dbo.tbl_cuarentena_atenciones (
-    id_cuarentena INT IDENTITY(1,1) PRIMARY KEY,
-    co_establecimiento VARCHAR(50),
-    fecha_atencion VARCHAR(50),
-    edad VARCHAR(50),
+    id_cuarentena INT IDENTITY(1,1) NOT NULL,
+    anio        VARCHAR(50),
+    nro_mes     VARCHAR(50),
+    ubigeo      VARCHAR(50),
+    provincia   VARCHAR(100),
     diagnostico VARCHAR(100),
-    motivo_error VARCHAR(255),
-    fecha_rechazo DATETIME DEFAULT GETDATE()
-);
-GO
-IF COL_LENGTH('dbo.tbl_cuarentena_atenciones','lote_id') IS NULL
-    ALTER TABLE dbo.tbl_cuarentena_atenciones ADD lote_id VARCHAR(50) NULL;
-GO
-
-IF OBJECT_ID('dbo.tbl_tamizajes_salud_mental_limpio','U') IS NULL
-CREATE TABLE dbo.tbl_tamizajes_salud_mental_limpio (
-    id_tamizaje INT IDENTITY(1,1) PRIMARY KEY,
-    anio SMALLINT,
-    nro_mes TINYINT,
-    ubigeo VARCHAR(10),
-    departamento VARCHAR(50),
-    provincia VARCHAR(50),
-    distrito VARCHAR(50),
-    sexo VARCHAR(50),
-    etapa VARCHAR(50),
-    grupo_tamizaje VARCHAR(50),
-    detalle_tamizaje VARCHAR(50),
-    casos INT,
-    fecha_carga DATETIME DEFAULT GETDATE()
+    atendidos   VARCHAR(50),
+    atenciones  VARCHAR(50),
+    motivo_error VARCHAR(255) NOT NULL,
+    lote_id      VARCHAR(50),
+    fecha_rechazo DATETIME NOT NULL DEFAULT GETDATE(),
+    CONSTRAINT PK_Cuarentena_Atenciones PRIMARY KEY (id_cuarentena)
 );
 GO
 
-IF OBJECT_ID('dbo.tbl_cuarentena_tamizajes','U') IS NULL
-CREATE TABLE dbo.tbl_cuarentena_tamizajes (
-    id_cuarentena INT IDENTITY(1,1) PRIMARY KEY,
-    anio VARCHAR(20),
-    nro_mes VARCHAR(20),
-    ubigeo VARCHAR(20),
-    provincia VARCHAR(100),
-    casos VARCHAR(20),
-    motivo_error VARCHAR(255),
-    lote_id VARCHAR(50),
-    fecha_rechazo DATETIME DEFAULT GETDATE()
-);
-GO
-
--- Tabla de log de auditoria (la exige la rubrica). La escriben triggers y procedimientos.
+-- ---- TABLA DE APOYO 3: LOG DE AUDITORIA ----
+-- Libro de registro: quien hizo que y cuando. Lo escriben los triggers y los procedimientos.
 IF OBJECT_ID('dbo.log_auditoria','U') IS NULL
 CREATE TABLE dbo.log_auditoria (
-    id_log INT IDENTITY(1,1) PRIMARY KEY,
-    tabla VARCHAR(100) NOT NULL,
-    operacion VARCHAR(20) NOT NULL,      -- INSERT, UPDATE, DELETE, INGESTA, ERROR
+    id_log      INT IDENTITY(1,1) NOT NULL,
+    tabla       VARCHAR(100) NOT NULL,
+    operacion   VARCHAR(20)  NOT NULL,      -- INSERT, UPDATE, DELETE, INGESTA, CARGA_CSV, ERROR...
     registro_id INT NULL,
-    usuario VARCHAR(128) NOT NULL DEFAULT SUSER_SNAME(),
-    fecha_hora DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    usuario     VARCHAR(128) NOT NULL DEFAULT SUSER_SNAME(),
+    fecha_hora  DATETIME2    NOT NULL DEFAULT SYSDATETIME(),
     valor_anterior VARCHAR(MAX) NULL,
-    valor_nuevo VARCHAR(MAX) NULL,
-    lote_id VARCHAR(50) NULL,
-    detalle VARCHAR(1000) NULL
+    valor_nuevo    VARCHAR(MAX) NULL,
+    lote_id     VARCHAR(50)  NULL,
+    detalle     VARCHAR(1000) NULL,
+    CONSTRAINT PK_Log_Auditoria PRIMARY KEY (id_log)
 );
 GO
 
--- Tabla de log del ETL (la exige la rubrica para el Data Warehouse)
+-- ---- TABLA DE APOYO 4: LOG DEL ETL ----
+-- Boleta del proceso: cuantas filas paso por cada paso (lectura, cuarentena, catalogos, hechos,
+-- warehouse) y si las sumas cuadraron.
 IF OBJECT_ID('dbo.etl_log','U') IS NULL
 CREATE TABLE dbo.etl_log (
-    id_etl INT IDENTITY(1,1) PRIMARY KEY,
-    ejecucion_id UNIQUEIDENTIFIER NOT NULL,
-    etapa VARCHAR(60) NOT NULL,
-    tabla_destino VARCHAR(100) NULL,
-    filas_leidas INT NULL,
+    id_etl         INT IDENTITY(1,1) NOT NULL,
+    ejecucion_id   UNIQUEIDENTIFIER NOT NULL,
+    etapa          VARCHAR(60) NOT NULL,
+    tabla_destino  VARCHAR(100) NULL,
+    filas_leidas   INT NULL,
     filas_cargadas INT NULL,
-    estado VARCHAR(20) NOT NULL DEFAULT 'OK',
-    detalle VARCHAR(1000) NULL,
-    fecha_hora DATETIME2 NOT NULL DEFAULT SYSDATETIME()
+    estado         VARCHAR(20) NOT NULL DEFAULT 'OK',
+    detalle        VARCHAR(1000) NULL,
+    fecha_hora     DATETIME2 NOT NULL DEFAULT SYSDATETIME(),
+    CONSTRAINT PK_Etl_Log PRIMARY KEY (id_etl)
 );
 GO
+```
 
--- Data Warehouse (modelo estrella Kimball)
-IF OBJECT_ID('dbo.Dim_Ubicacion','U') IS NULL
-CREATE TABLE dbo.Dim_Ubicacion (
-    id_ubicacion INT IDENTITY(1,1) PRIMARY KEY,
-    ubigeo VARCHAR(10), departamento VARCHAR(50), provincia VARCHAR(50), distrito VARCHAR(50)
-);
-IF OBJECT_ID('dbo.Dim_Tiempo','U') IS NULL
-CREATE TABLE dbo.Dim_Tiempo (
-    id_tiempo INT IDENTITY(1,1) PRIMARY KEY,
-    anio SMALLINT, nro_mes TINYINT
-);
-IF OBJECT_ID('dbo.Dim_Perfil','U') IS NULL
-CREATE TABLE dbo.Dim_Perfil (
-    id_perfil INT IDENTITY(1,1) PRIMARY KEY,
-    sexo VARCHAR(50), etapa VARCHAR(50), grupo_tamizaje VARCHAR(50), detalle_tamizaje VARCHAR(50)
-);
-IF OBJECT_ID('dbo.Fact_Tamizajes','U') IS NULL
-CREATE TABLE dbo.Fact_Tamizajes (
-    id_fact INT IDENTITY(1,1) PRIMARY KEY,
-    id_ubicacion INT FOREIGN KEY REFERENCES dbo.Dim_Ubicacion(id_ubicacion),
-    id_tiempo INT FOREIGN KEY REFERENCES dbo.Dim_Tiempo(id_tiempo),
-    id_perfil INT FOREIGN KEY REFERENCES dbo.Dim_Perfil(id_perfil),
-    casos INT
-);
+### `02_funciones.sql`
+
+Dos funciones: `fn_promedio_atenciones` (atenciones por persona atendida, sin dividir entre cero) y `fn_etiqueta_seguimiento` (texto segun si hubo seguimiento).
+
+```sql
+-- 01_DATABASE/02_funciones.sql
+
+USE BD_DataSalud_Atenciones;
 GO
 
-/* ---------------------------------------------------------------------
-   1. FUNCION REUTILIZABLE: grupo etario (etapas de vida MINSA)
-   --------------------------------------------------------------------- */
-CREATE OR ALTER FUNCTION dbo.fn_grupo_etario (@edad INT)
-RETURNS VARCHAR(20)
+-- 1. FUNCIONES
+-- Promedio de atenciones por persona atendida (si atendidos = 0 no se divide: devuelve 0)
+CREATE OR ALTER FUNCTION dbo.fn_promedio_atenciones (@atendidos INT, @atenciones INT)
+RETURNS DECIMAL(10,2)
 AS
 BEGIN
     RETURN CASE
-        WHEN @edad IS NULL OR @edad < 0 OR @edad > 120 THEN 'No registrado'
-        WHEN @edad <= 11 THEN 'Nino'
-        WHEN @edad <= 17 THEN 'Adolescente'
-        WHEN @edad <= 29 THEN 'Joven'
-        WHEN @edad <= 59 THEN 'Adulto'
-        ELSE 'Adulto mayor'
+        WHEN @atendidos IS NULL OR @atenciones IS NULL THEN 0
+        WHEN @atendidos = 0 THEN 0                       -- evita dividir entre cero
+        ELSE CAST(@atenciones AS DECIMAL(10,2)) / @atendidos
     END;
 END;
 GO
 
-/* ---------------------------------------------------------------------
-   2. TRIGGERS
-   2.1 Auditoria DML: registra quien, cuando y los valores antes/despues.
-       Si falla el log, falla la operacion (no se pierde trazabilidad).
-   --------------------------------------------------------------------- */
-CREATE OR ALTER TRIGGER dbo.trg_audit_atenciones
-ON dbo.tbl_atenciones_salud_mental
-AFTER INSERT, UPDATE, DELETE
+-- Etiqueta clara segun si hubo seguimiento o no
+CREATE OR ALTER FUNCTION dbo.fn_etiqueta_seguimiento (@atendidos INT, @atenciones INT)
+RETURNS VARCHAR(40)
 AS
 BEGIN
-    SET NOCOUNT ON;
-    INSERT INTO dbo.log_auditoria (tabla, operacion, registro_id, valor_anterior, valor_nuevo)
-    SELECT
-        'tbl_atenciones_salud_mental',
-        CASE WHEN i.id_atencion IS NOT NULL AND d.id_atencion IS NULL THEN 'INSERT'
-             WHEN i.id_atencion IS NOT NULL AND d.id_atencion IS NOT NULL THEN 'UPDATE'
-             ELSE 'DELETE' END,
-        COALESCE(i.id_atencion, d.id_atencion),
-        CASE WHEN d.id_atencion IS NULL THEN NULL ELSE
-            CONCAT('est=', d.co_establecimiento, '; fecha=', d.fecha_atencion, '; edad=', d.edad,
-                   '; sexo=', d.sexo, '; diag=', d.diagnostico) END,
-        CASE WHEN i.id_atencion IS NULL THEN NULL ELSE
-            CONCAT('est=', i.co_establecimiento, '; fecha=', i.fecha_atencion, '; edad=', i.edad,
-                   '; sexo=', i.sexo, '; diag=', i.diagnostico) END
-    FROM inserted i
-    FULL OUTER JOIN deleted d ON i.id_atencion = d.id_atencion;
+    RETURN CASE
+        WHEN @atendidos IS NULL OR @atenciones IS NULL THEN 'No registrado'
+        WHEN @atendidos = 0 AND @atenciones = 0 THEN 'Sin actividad'
+        WHEN @atendidos = 0 THEN 'Solo seguimiento'          -- hubo atencion, pero no hay atendidos nuevos
+        WHEN @atenciones > @atendidos THEN 'Con seguimiento' -- mas de una atencion por persona
+        ELSE 'Atencion unica'
+    END;
 END;
 GO
+```
 
--- 2.2 Integridad: rechaza edades fuera de rango, fechas futuras y diagnostico vacio
-CREATE OR ALTER TRIGGER dbo.trg_integridad_atenciones
-ON dbo.tbl_atenciones_salud_mental
-AFTER INSERT, UPDATE
-AS
-BEGIN
-    SET NOCOUNT ON;
-    IF EXISTS (SELECT 1 FROM inserted
-               WHERE edad < 0 OR edad > 120
-                  OR fecha_atencion > CAST(GETDATE() AS DATE)
-                  OR LTRIM(RTRIM(diagnostico)) = '')
-    BEGIN
-        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
-        THROW 50001, 'Integridad: edad fuera de 0-120, fecha futura o diagnostico vacio. Operacion revertida.', 1;
-    END
-END;
+### `03_vistas.sql`
+
+Tres vistas para el analista: totales por ubicacion y diagnostico, evolucion mensual, y por sexo/etapa/diagnostico.
+
+```sql
+-- 01_DATABASE/03_vistas.sql
+
+USE BD_DataSalud_Atenciones;
 GO
 
-/* ---------------------------------------------------------------------
-   3. PROCEDIMIENTOS ALMACENADOS
-   3.1 Ingesta y validacion de atenciones (staging -> tabla final)
-       - Clasifica cada fila UNA vez en #clasif con su motivo de rechazo.
-       - Rechazadas y duplicadas van a cuarentena (nada se pierde en silencio).
-       - SAVEPOINT despues de la cuarentena: si falla la carga final se
-         revierte solo la carga y se conserva la cuarentena.
-       - Idempotente: no vuelve a cargar lo que ya existe.
-   --------------------------------------------------------------------- */
-CREATE OR ALTER PROCEDURE dbo.usp_ingesta_y_validar_atenciones
-    @lote_id VARCHAR(50)
-AS
-BEGIN
-    SET NOCOUNT ON;
-    DECLARE @sp_creado BIT = 0, @leidos INT = 0, @cuarentena INT = 0, @cargados INT = 0;
-    IF OBJECT_ID('tempdb..#clasif') IS NOT NULL DROP TABLE #clasif;
-
-    BEGIN TRY
-        BEGIN TRANSACTION;
-
-        ;WITH s AS (
-            SELECT id_staging,
-                   LTRIM(RTRIM(Co_Establecimiento)) AS co_est,
-                   Nom_Establecimiento AS nom_est,
-                   Fecha_Atencion AS fecha_txt,
-                   TRY_CAST(Fecha_Atencion AS DATE) AS fecha,
-                   Edad AS edad_txt,
-                   TRY_CAST(Edad AS INT) AS edad,
-                   CASE WHEN UPPER(LEFT(LTRIM(Sexo),1)) IN ('M','F') THEN UPPER(LEFT(LTRIM(Sexo),1)) END AS sexo,
-                   LTRIM(RTRIM(Diagnostico)) AS diag,
-                   Ubigeo AS ubigeo
-            FROM dbo.staging_atenciones_mental
-        ), r AS (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY co_est, fecha, edad, sexo, diag ORDER BY id_staging) AS rn
-            FROM s
-        )
-        SELECT r.*,
-               CASE
-                 WHEN NULLIF(diag,'') IS NULL THEN 'Diagnostico nulo o vacio'
-                 WHEN NULLIF(LTRIM(RTRIM(fecha_txt)),'') IS NULL THEN 'Fecha nula o vacia'
-                 WHEN fecha IS NULL THEN 'Fecha con formato invalido'
-                 WHEN fecha > CAST(GETDATE() AS DATE) THEN 'Fecha futura'
-                 WHEN edad IS NULL OR edad NOT BETWEEN 0 AND 120 THEN 'Edad invalida o fuera de rango'
-                 WHEN NULLIF(co_est,'') IS NULL THEN 'Establecimiento nulo o vacio'
-                 WHEN rn > 1 THEN 'Duplicado dentro del lote'
-                 WHEN EXISTS (SELECT 1 FROM dbo.tbl_atenciones_salud_mental a
-                              WHERE a.co_establecimiento = r.co_est AND a.fecha_atencion = r.fecha
-                                AND a.edad = r.edad AND ISNULL(a.sexo,'?') = ISNULL(r.sexo,'?')
-                                AND a.diagnostico = r.diag) THEN 'Ya existe en tabla final'
-               END AS motivo
-        INTO #clasif
-        FROM r;
-
-        SELECT @leidos = COUNT(*) FROM #clasif;
-
-        INSERT INTO dbo.tbl_cuarentena_atenciones (co_establecimiento, fecha_atencion, edad, diagnostico, motivo_error, lote_id)
-        SELECT co_est, fecha_txt, edad_txt, diag, motivo, @lote_id
-        FROM #clasif WHERE motivo IS NOT NULL;
-        SET @cuarentena = @@ROWCOUNT;
-
-        SAVE TRANSACTION sp_post_cuarentena;
-        SET @sp_creado = 1;
-
-        INSERT INTO dbo.tbl_atenciones_salud_mental (co_establecimiento, nom_establecimiento, fecha_atencion, edad, sexo, diagnostico, ubigeo)
-        SELECT co_est, nom_est, fecha, edad, sexo, diag, ubigeo
-        FROM #clasif WHERE motivo IS NULL;
-        SET @cargados = @@ROWCOUNT;
-
-        INSERT INTO dbo.log_auditoria (tabla, operacion, lote_id, detalle)
-        VALUES ('tbl_atenciones_salud_mental', 'INGESTA', @lote_id,
-                CONCAT('leidos=', @leidos, '; cargados=', @cargados, '; cuarentena=', @cuarentena));
-
-        COMMIT TRANSACTION;
-        PRINT CONCAT('Ingesta OK. Leidos: ', @leidos, ' | Cargados: ', @cargados, ' | Cuarentena: ', @cuarentena);
-    END TRY
-    BEGIN CATCH
-        DECLARE @msg NVARCHAR(2000) = ERROR_MESSAGE(), @num INT = ERROR_NUMBER();
-        DECLARE @alcance VARCHAR(30) = 'ninguno';
-
-        IF XACT_STATE() = 1 AND @sp_creado = 1
-        BEGIN
-            ROLLBACK TRANSACTION sp_post_cuarentena;  -- deshace solo la carga final
-            COMMIT TRANSACTION;                        -- conserva la cuarentena
-            SET @alcance = 'parcial (savepoint)';
-        END
-        ELSE IF @@TRANCOUNT > 0
-        BEGIN
-            ROLLBACK TRANSACTION;                      -- rollback total
-            SET @alcance = 'total';
-        END
-
-        INSERT INTO dbo.log_auditoria (tabla, operacion, lote_id, detalle)
-        VALUES ('tbl_atenciones_salud_mental', 'ERROR', @lote_id,
-                CONCAT('Error ', @num, ': ', @msg, ' | rollback ', @alcance));
-        THROW;
-    END CATCH
-END;
+-- 4. VISTAS
+-- 4.1 Totales por departamento, provincia y diagnostico
+CREATE OR ALTER VIEW dbo.vw_total_por_ubicacion_diagnostico AS
+SELECT u.departamento, u.provincia, d.diagnostico,
+       SUM(f.atendidos)  AS total_atendidos,
+       SUM(f.atenciones) AS total_atenciones
+FROM dbo.Atencion_Diagnostico f
+JOIN dbo.Ubicacion u ON u.id_ubicacion = f.id_ubicacion
+JOIN dbo.Diagnostico d ON d.id_diagnostico = f.id_diagnostico
+GROUP BY u.departamento, u.provincia, d.diagnostico;
 GO
 
-/* 3.2 Procesamiento de tamizajes (fuente importada -> tabla limpia) con cuarentena */
-CREATE OR ALTER PROCEDURE dbo.usp_procesar_tamizajes_salud_mental
-    @lote_id VARCHAR(50) = NULL
-AS
-BEGIN
-    SET NOCOUNT ON;
-    DECLARE @sp_creado BIT = 0, @leidos INT = 0, @cuarentena INT = 0, @cargados INT = 0;
-    SET @lote_id = ISNULL(@lote_id, CONCAT('TAM_', FORMAT(SYSDATETIME(), 'yyyyMMdd_HHmmss')));
-    IF OBJECT_ID('tempdb..#clasif_t') IS NOT NULL DROP TABLE #clasif_t;
-
-    BEGIN TRY
-        BEGIN TRANSACTION;
-
-        -- SUPUESTO: la clave de negocio es anio+mes+ubigeo+sexo+etapa+grupo+detalle.
-        -- Si la fuente repite la clave, se conserva la primera fila y las demas van a cuarentena.
-        ;WITH s AS (
-            SELECT TRY_CAST(Anio AS SMALLINT) AS anio, Anio AS anio_txt,
-                   TRY_CAST(NroMes AS TINYINT) AS nro_mes, NroMes AS mes_txt,
-                   ubigeo, Departamento AS departamento, Provincia AS provincia, Distrito AS distrito,
-                   Sexo AS sexo, Etapa AS etapa, GrupoTamizaje AS grupo_tamizaje, DetalleTamizaje AS detalle_tamizaje,
-                   TRY_CAST(Casos AS INT) AS casos, Casos AS casos_txt
-            FROM dbo.[DAT SALUD MENTAL - TAMIZAJE]
-        ), r AS (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY anio, nro_mes, ubigeo, sexo, etapa, grupo_tamizaje, detalle_tamizaje
-                                         ORDER BY (SELECT NULL)) AS rn
-            FROM s
-        )
-        SELECT r.*,
-               CASE
-                 WHEN anio IS NULL THEN 'Anio nulo o invalido'
-                 WHEN nro_mes IS NULL OR nro_mes NOT BETWEEN 1 AND 12 THEN 'Mes nulo o fuera de 1-12'
-                 WHEN casos IS NULL OR casos < 0 THEN 'Casos nulos o negativos'
-                 WHEN NULLIF(LTRIM(RTRIM(provincia)),'') IS NULL THEN 'Provincia nula o vacia'
-                 WHEN rn > 1 THEN 'Duplicado en la fuente'
-                 WHEN EXISTS (SELECT 1 FROM dbo.tbl_tamizajes_salud_mental_limpio t
-                              WHERE t.anio = r.anio AND t.nro_mes = r.nro_mes AND t.ubigeo = r.ubigeo
-                                AND t.sexo = r.sexo AND t.etapa = r.etapa
-                                AND t.grupo_tamizaje = r.grupo_tamizaje AND t.detalle_tamizaje = r.detalle_tamizaje)
-                      THEN 'Ya existe en tabla final'
-               END AS motivo
-        INTO #clasif_t
-        FROM r;
-
-        SELECT @leidos = COUNT(*) FROM #clasif_t;
-
-        INSERT INTO dbo.tbl_cuarentena_tamizajes (anio, nro_mes, ubigeo, provincia, casos, motivo_error, lote_id)
-        SELECT anio_txt, mes_txt, ubigeo, provincia, casos_txt, motivo, @lote_id
-        FROM #clasif_t WHERE motivo IS NOT NULL;
-        SET @cuarentena = @@ROWCOUNT;
-
-        SAVE TRANSACTION sp_post_cuarentena_t;
-        SET @sp_creado = 1;
-
-        INSERT INTO dbo.tbl_tamizajes_salud_mental_limpio
-               (anio, nro_mes, ubigeo, departamento, provincia, distrito, sexo, etapa, grupo_tamizaje, detalle_tamizaje, casos)
-        SELECT anio, nro_mes, ubigeo, departamento, provincia, distrito, sexo, etapa, grupo_tamizaje, detalle_tamizaje, casos
-        FROM #clasif_t WHERE motivo IS NULL;
-        SET @cargados = @@ROWCOUNT;
-
-        INSERT INTO dbo.log_auditoria (tabla, operacion, lote_id, detalle)
-        VALUES ('tbl_tamizajes_salud_mental_limpio', 'INGESTA', @lote_id,
-                CONCAT('leidos=', @leidos, '; cargados=', @cargados, '; cuarentena=', @cuarentena));
-
-        COMMIT TRANSACTION;
-        PRINT CONCAT('Tamizajes OK. Leidos: ', @leidos, ' | Cargados: ', @cargados, ' | Cuarentena: ', @cuarentena);
-    END TRY
-    BEGIN CATCH
-        DECLARE @msg NVARCHAR(2000) = ERROR_MESSAGE(), @num INT = ERROR_NUMBER();
-        DECLARE @alcance VARCHAR(30) = 'ninguno';
-
-        IF XACT_STATE() = 1 AND @sp_creado = 1
-        BEGIN
-            ROLLBACK TRANSACTION sp_post_cuarentena_t;
-            COMMIT TRANSACTION;
-            SET @alcance = 'parcial (savepoint)';
-        END
-        ELSE IF @@TRANCOUNT > 0
-        BEGIN
-            ROLLBACK TRANSACTION;
-            SET @alcance = 'total';
-        END
-
-        INSERT INTO dbo.log_auditoria (tabla, operacion, lote_id, detalle)
-        VALUES ('tbl_tamizajes_salud_mental_limpio', 'ERROR', @lote_id,
-                CONCAT('Error ', @num, ': ', @msg, ' | rollback ', @alcance));
-        THROW;
-    END CATCH
-END;
-GO
-
-/* ---------------------------------------------------------------------
-   4. VISTAS ANALITICAS (el analista solo vera estas, no las tablas base)
-   --------------------------------------------------------------------- */
-CREATE OR ALTER VIEW dbo.vw_tamizajes_por_provincia AS
-SELECT provincia, etapa, SUM(casos) AS TotalCasos
-FROM dbo.tbl_tamizajes_salud_mental_limpio
-WHERE provincia IS NOT NULL AND provincia <> ''
-GROUP BY provincia, etapa;
-GO
-CREATE OR ALTER VIEW dbo.vw_tamizajes_tendencia_temporal AS
-SELECT anio, nro_mes, SUM(casos) AS TotalCasosMensuales
-FROM dbo.tbl_tamizajes_salud_mental_limpio
+-- 4.2 Evolucion por anio y mes
+CREATE OR ALTER VIEW dbo.vw_evolucion_mensual AS
+SELECT anio, nro_mes,
+       SUM(atendidos)  AS total_atendidos,
+       SUM(atenciones) AS total_atenciones
+FROM dbo.Atencion_Diagnostico
 GROUP BY anio, nro_mes;
 GO
 
-/* ---------------------------------------------------------------------
-   5. ETL DEL DATA WAREHOUSE (idempotente, con log por etapa y reconciliacion)
-   --------------------------------------------------------------------- */
-CREATE OR ALTER PROCEDURE dbo.usp_etl_dw_tamizajes
-AS
-BEGIN
-    SET NOCOUNT ON;
-    DECLARE @id UNIQUEIDENTIFIER = NEWID(), @n INT = 0, @leidos INT = 0;
-    DECLARE @suma_src BIGINT, @suma_fact BIGINT;
-    IF OBJECT_ID('tempdb..#src') IS NOT NULL DROP TABLE #src;
+-- 4.3 Por sexo, etapa y diagnostico (con el promedio de la funcion)
+CREATE OR ALTER VIEW dbo.vw_por_sexo_etapa_diagnostico AS
+SELECT g.sexo, e.etapa, d.diagnostico,
+       SUM(f.atendidos)  AS total_atendidos,
+       SUM(f.atenciones) AS total_atenciones,
+       dbo.fn_promedio_atenciones(SUM(f.atendidos), SUM(f.atenciones)) AS promedio_atenciones
+FROM dbo.Atencion_Diagnostico f
+JOIN dbo.Genero g ON g.id_genero = f.id_genero
+JOIN dbo.Rango_Edad e ON e.id_rango_edad = f.id_rango_edad
+JOIN dbo.Diagnostico d ON d.id_diagnostico = f.id_diagnostico
+GROUP BY g.sexo, e.etapa, d.diagnostico;
+GO
+```
 
-    BEGIN TRY
-        BEGIN TRANSACTION;
+### `04_warehouse_tablas.sql`
 
-        -- E + T: extraccion y limpieza. Vacios -> 'No registrado' para que los joins no pierdan filas con NULL.
-        SELECT anio, nro_mes,
-               ISNULL(NULLIF(LTRIM(RTRIM(ubigeo)),''),'SIN_UBIGEO') AS ubigeo,
-               ISNULL(NULLIF(LTRIM(RTRIM(departamento)),''),'No registrado') AS departamento,
-               ISNULL(NULLIF(LTRIM(RTRIM(provincia)),''),'No registrado') AS provincia,
-               ISNULL(NULLIF(LTRIM(RTRIM(distrito)),''),'No registrado') AS distrito,
-               ISNULL(NULLIF(LTRIM(RTRIM(sexo)),''),'No registrado') AS sexo,
-               ISNULL(NULLIF(LTRIM(RTRIM(etapa)),''),'No registrado') AS etapa,
-               ISNULL(NULLIF(LTRIM(RTRIM(grupo_tamizaje)),''),'No registrado') AS grupo_tamizaje,
-               ISNULL(NULLIF(LTRIM(RTRIM(detalle_tamizaje)),''),'No registrado') AS detalle_tamizaje,
-               casos
-        INTO #src
-        FROM dbo.tbl_tamizajes_salud_mental_limpio
-        WHERE anio IS NOT NULL AND nro_mes IS NOT NULL AND casos IS NOT NULL;
-        SET @leidos = @@ROWCOUNT;
-        INSERT INTO dbo.etl_log (ejecucion_id, etapa, tabla_destino, filas_leidas, filas_cargadas, detalle)
-        VALUES (@id, 'EXTRACCION_Y_LIMPIEZA', '#src', @leidos, @leidos,
-                'TRIM; vacios -> No registrado; ubigeo vacio -> SIN_UBIGEO; se excluyen filas sin anio, mes o casos');
+Esquema `dw` y las 3 tablas resumen que se llevan a Power BI (se llenan con `02_AUTOMATIZACION/04_warehouse_carga.sql`).
 
-        -- L: dimensiones (solo agrega miembros nuevos; EXCEPT trata NULL como igual)
-        INSERT INTO dbo.Dim_Ubicacion (ubigeo, departamento, provincia, distrito)
-        SELECT ubigeo, departamento, provincia, distrito FROM #src
-        EXCEPT SELECT ubigeo, departamento, provincia, distrito FROM dbo.Dim_Ubicacion;
-        SET @n = @@ROWCOUNT;
-        INSERT INTO dbo.etl_log (ejecucion_id, etapa, tabla_destino, filas_leidas, filas_cargadas, detalle)
-        VALUES (@id, 'CARGA_DIMENSION', 'Dim_Ubicacion', @leidos, @n, 'Solo miembros nuevos (EXCEPT)');
+```sql
+-- 01_DATABASE/04_warehouse_tablas.sql
 
-        INSERT INTO dbo.Dim_Tiempo (anio, nro_mes)
-        SELECT anio, nro_mes FROM #src
-        EXCEPT SELECT anio, nro_mes FROM dbo.Dim_Tiempo;
-        SET @n = @@ROWCOUNT;
-        INSERT INTO dbo.etl_log (ejecucion_id, etapa, tabla_destino, filas_leidas, filas_cargadas, detalle)
-        VALUES (@id, 'CARGA_DIMENSION', 'Dim_Tiempo', @leidos, @n, 'Solo miembros nuevos (EXCEPT)');
-
-        INSERT INTO dbo.Dim_Perfil (sexo, etapa, grupo_tamizaje, detalle_tamizaje)
-        SELECT sexo, etapa, grupo_tamizaje, detalle_tamizaje FROM #src
-        EXCEPT SELECT sexo, etapa, grupo_tamizaje, detalle_tamizaje FROM dbo.Dim_Perfil;
-        SET @n = @@ROWCOUNT;
-        INSERT INTO dbo.etl_log (ejecucion_id, etapa, tabla_destino, filas_leidas, filas_cargadas, detalle)
-        VALUES (@id, 'CARGA_DIMENSION', 'Dim_Perfil', @leidos, @n, 'Solo miembros nuevos (EXCEPT)');
-
-        -- L: hechos (recarga completa para ser idempotente)
-        DELETE FROM dbo.Fact_Tamizajes;
-        INSERT INTO dbo.Fact_Tamizajes (id_ubicacion, id_tiempo, id_perfil, casos)
-        SELECT u.id_ubicacion, t.id_tiempo, p.id_perfil, s.casos
-        FROM #src s
-        JOIN dbo.Dim_Ubicacion u ON u.ubigeo = s.ubigeo AND u.departamento = s.departamento
-                                 AND u.provincia = s.provincia AND u.distrito = s.distrito
-        JOIN dbo.Dim_Tiempo t ON t.anio = s.anio AND t.nro_mes = s.nro_mes
-        JOIN dbo.Dim_Perfil p ON p.sexo = s.sexo AND p.etapa = s.etapa
-                              AND p.grupo_tamizaje = s.grupo_tamizaje AND p.detalle_tamizaje = s.detalle_tamizaje;
-        SET @n = @@ROWCOUNT;
-        INSERT INTO dbo.etl_log (ejecucion_id, etapa, tabla_destino, filas_leidas, filas_cargadas, detalle)
-        VALUES (@id, 'CARGA_HECHOS', 'Fact_Tamizajes', @leidos, @n, 'Recarga completa; joins por todas las columnas de la dimension');
-
-        -- Reconciliacion: la suma de casos debe coincidir entre origen y hechos
-        SELECT @suma_src = SUM(CAST(casos AS BIGINT)) FROM #src;
-        SELECT @suma_fact = SUM(CAST(casos AS BIGINT)) FROM dbo.Fact_Tamizajes;
-        IF ISNULL(@suma_src,0) <> ISNULL(@suma_fact,0)
-            THROW 50010, 'Reconciliacion fallida: la suma de casos del origen no coincide con Fact_Tamizajes.', 1;
-        INSERT INTO dbo.etl_log (ejecucion_id, etapa, tabla_destino, filas_leidas, filas_cargadas, detalle)
-        VALUES (@id, 'RECONCILIACION', 'Fact_Tamizajes', @leidos, @n, CONCAT('Suma de casos origen = hechos = ', @suma_fact));
-
-        COMMIT TRANSACTION;
-        PRINT CONCAT('ETL OK. Ejecucion: ', CAST(@id AS VARCHAR(36)));
-    END TRY
-    BEGIN CATCH
-        DECLARE @msg NVARCHAR(2000) = ERROR_MESSAGE();
-        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
-        INSERT INTO dbo.etl_log (ejecucion_id, etapa, tabla_destino, estado, detalle)
-        VALUES (@id, 'ERROR', NULL, 'ERROR', LEFT(@msg, 1000));
-        THROW;
-    END CATCH
-END;
+USE BD_DataSalud_Atenciones;
 GO
 
-/* OPCIONAL (una sola vez): si ya corriste el ETL anterior y quedaron dimensiones duplicadas o con NULL, limpia asi:
-   DELETE FROM dbo.Fact_Tamizajes;
-   DELETE FROM dbo.Dim_Ubicacion; DELETE FROM dbo.Dim_Tiempo; DELETE FROM dbo.Dim_Perfil;
-   DBCC CHECKIDENT ('dbo.Dim_Ubicacion', RESEED, 0); DBCC CHECKIDENT ('dbo.Dim_Tiempo', RESEED, 0);
-   DBCC CHECKIDENT ('dbo.Dim_Perfil', RESEED, 0);
-*/
-
-/* ---------------------------------------------------------------------
-   6. SEGURIDAD: roles con minimo privilegio y segregacion de funciones
-   Las vistas y procedimientos pertenecen a dbo, por lo que el encadenamiento de propiedad
-   permite al analista leer las vistas sin tener acceso a las tablas base.
-   --------------------------------------------------------------------- */
-IF DATABASE_PRINCIPAL_ID('Rol_Administrador_Salud') IS NULL CREATE ROLE Rol_Administrador_Salud;
-IF DATABASE_PRINCIPAL_ID('Rol_Analista_Datos') IS NULL CREATE ROLE Rol_Analista_Datos;
-IF DATABASE_PRINCIPAL_ID('Rol_Auditor') IS NULL CREATE ROLE Rol_Auditor;
+-- 5.2 DATA WAREHOUSE (crear): 3 tablas resumen en el esquema dw para Power BI.
+--     Aqui solo se crea la estructura; se llena al final con usp_cargar_warehouse (paso 10.5).
+IF SCHEMA_ID('dw') IS NULL EXEC('CREATE SCHEMA dw AUTHORIZATION dbo');
 GO
 
--- Se retiran los permisos amplios del script original
-REVOKE CONTROL ON DATABASE::BD_DataSalud_LaLibertad FROM Rol_Administrador_Salud;
-REVOKE SELECT ON dbo.tbl_tamizajes_salud_mental_limpio FROM Rol_Analista_Datos;
-REVOKE SELECT ON dbo.tbl_tamizajes_salud_mental_limpio FROM Rol_Auditor;
+-- ---- TABLA RESUMEN 1: Tiempo x Diagnostico ----
+-- Para que sirve: responde "como evoluciona cada tipo de caso mes a mes?".
+-- En Power BI: grafico de lineas o columnas por anio/mes con el diagnostico como filtro.
+IF OBJECT_ID('dw.Resumen_Tiempo_Diagnostico','U') IS NULL
+CREATE TABLE dw.Resumen_Tiempo_Diagnostico (
+    id_resumen          INT IDENTITY(1,1) NOT NULL,
+    anio                SMALLINT NOT NULL,
+    nro_mes             TINYINT  NOT NULL,
+    diagnostico         VARCHAR(100) NOT NULL,
+    total_atendidos     INT NOT NULL,
+    total_atenciones    INT NOT NULL,
+    promedio_atenciones DECIMAL(10,2) NOT NULL,   -- atenciones por persona atendida
+    fecha_actualizacion DATETIME NOT NULL DEFAULT GETDATE(),
+    CONSTRAINT PK_Resumen_Tiempo_Diagnostico PRIMARY KEY (id_resumen),
+    CONSTRAINT UQ_Resumen_Tiempo_Diagnostico UNIQUE (anio, nro_mes, diagnostico)
+);
 GO
 
--- Administrador: opera y mantiene, pero NO puede alterar el log de auditoria
-ALTER ROLE db_ddladmin ADD MEMBER Rol_Administrador_Salud;
-GRANT SELECT, INSERT, UPDATE, DELETE, EXECUTE ON SCHEMA::dbo TO Rol_Administrador_Salud;
-DENY INSERT, UPDATE, DELETE ON dbo.log_auditoria TO Rol_Administrador_Salud;
+-- ---- TABLA RESUMEN 2: Ubicacion ----
+-- Para que sirve: responde "donde se concentran los casos?". Llega hasta provincia (no distrito)
+-- para que la tabla sea corta. En Power BI: mapa o barras por departamento/provincia.
+IF OBJECT_ID('dw.Resumen_Ubicacion','U') IS NULL
+CREATE TABLE dw.Resumen_Ubicacion (
+    id_resumen          INT IDENTITY(1,1) NOT NULL,
+    anio                SMALLINT NOT NULL,
+    departamento        VARCHAR(100) NOT NULL,
+    provincia           VARCHAR(100) NOT NULL,
+    diagnostico         VARCHAR(100) NOT NULL,
+    total_atendidos     INT NOT NULL,
+    total_atenciones    INT NOT NULL,
+    promedio_atenciones DECIMAL(10,2) NOT NULL,
+    fecha_actualizacion DATETIME NOT NULL DEFAULT GETDATE(),
+    CONSTRAINT PK_Resumen_Ubicacion PRIMARY KEY (id_resumen),
+    CONSTRAINT UQ_Resumen_Ubicacion UNIQUE (anio, departamento, provincia, diagnostico)
+);
 GO
 
--- Analista: solo vistas y modelo dimensional; sin acceso a tablas con detalle ni a logs
-GRANT SELECT ON dbo.vw_tamizajes_por_provincia TO Rol_Analista_Datos;
-GRANT SELECT ON dbo.vw_tamizajes_tendencia_temporal TO Rol_Analista_Datos;
-GRANT SELECT ON dbo.Dim_Ubicacion TO Rol_Analista_Datos;
-GRANT SELECT ON dbo.Dim_Tiempo TO Rol_Analista_Datos;
-GRANT SELECT ON dbo.Dim_Perfil TO Rol_Analista_Datos;
-GRANT SELECT ON dbo.Fact_Tamizajes TO Rol_Analista_Datos;
-DENY SELECT ON dbo.tbl_atenciones_salud_mental TO Rol_Analista_Datos;
-DENY SELECT ON dbo.staging_atenciones_mental TO Rol_Analista_Datos;
-DENY SELECT ON dbo.tbl_cuarentena_atenciones TO Rol_Analista_Datos;
-DENY SELECT ON dbo.tbl_cuarentena_tamizajes TO Rol_Analista_Datos;
-DENY SELECT ON dbo.log_auditoria TO Rol_Analista_Datos;
+-- ---- TABLA RESUMEN 3: Perfil (sexo y etapa) ----
+-- Para que sirve: responde "a quienes afecta mas?". En Power BI: barras por sexo y etapa de vida.
+IF OBJECT_ID('dw.Resumen_Perfil','U') IS NULL
+CREATE TABLE dw.Resumen_Perfil (
+    id_resumen          INT IDENTITY(1,1) NOT NULL,
+    anio                SMALLINT NOT NULL,
+    sexo                VARCHAR(20) NOT NULL,
+    etapa               VARCHAR(50) NOT NULL,
+    diagnostico         VARCHAR(100) NOT NULL,
+    total_atendidos     INT NOT NULL,
+    total_atenciones    INT NOT NULL,
+    promedio_atenciones DECIMAL(10,2) NOT NULL,
+    fecha_actualizacion DATETIME NOT NULL DEFAULT GETDATE(),
+    CONSTRAINT PK_Resumen_Perfil PRIMARY KEY (id_resumen),
+    CONSTRAINT UQ_Resumen_Perfil UNIQUE (anio, sexo, etapa, diagnostico)
+);
+GO
+```
+
+### `05_prueba_funciones.sql`
+
+Prueba rapida de las dos funciones.
+
+```sql
+-- 01_DATABASE/05_prueba_funciones.sql
+
+USE BD_DataSalud_Atenciones;
 GO
 
--- Auditor: solo lectura de log, cuarentena y log del ETL; no modifica nada
-GRANT SELECT ON dbo.log_auditoria TO Rol_Auditor;
-GRANT SELECT ON dbo.etl_log TO Rol_Auditor;
-GRANT SELECT ON dbo.tbl_cuarentena_atenciones TO Rol_Auditor;
-GRANT SELECT ON dbo.tbl_cuarentena_tamizajes TO Rol_Auditor;
-DENY INSERT, UPDATE, DELETE ON SCHEMA::dbo TO Rol_Auditor;
+-- 8.1 Funciones
+SELECT dbo.fn_etiqueta_seguimiento(0, 1)  AS solo_seguimiento,
+       dbo.fn_etiqueta_seguimiento(2, 7)  AS con_seguimiento,
+       dbo.fn_etiqueta_seguimiento(3, 3)  AS atencion_unica,
+       dbo.fn_etiqueta_seguimiento(NULL, 1) AS nulo,
+       dbo.fn_promedio_atenciones(2, 7)   AS promedio,
+       dbo.fn_promedio_atenciones(0, 5)   AS sin_dividir_entre_cero;
+GO
+```
+
+### `06_consultas_informe.sql`
+
+Consultas listas para el informe, sobre las tablas del warehouse. Ejecutar despues de importar los datos y cargar el warehouse.
+
+```sql
+-- 01_DATABASE/06_consultas_informe.sql
+
+USE BD_DataSalud_Atenciones;
 GO
 
--- Usuarios de prueba (sin login) para demostrar que cada rol falla donde debe
-IF DATABASE_PRINCIPAL_ID('u_analista_test') IS NULL CREATE USER u_analista_test WITHOUT LOGIN;
-IF DATABASE_PRINCIPAL_ID('u_auditor_test') IS NULL CREATE USER u_auditor_test WITHOUT LOGIN;
-ALTER ROLE Rol_Analista_Datos ADD MEMBER u_analista_test;
-ALTER ROLE Rol_Auditor ADD MEMBER u_auditor_test;
-GO
+-- 10.6 CONSULTAS PARA EL INFORME
+-- A) Total por anio y diagnostico
+SELECT anio, diagnostico, SUM(total_atendidos) AS atendidos, SUM(total_atenciones) AS atenciones
+FROM dw.Resumen_Tiempo_Diagnostico
+GROUP BY anio, diagnostico
+ORDER BY anio, diagnostico;
 
-/* ---------------------------------------------------------------------
-   7. INDICE Y METRICAS ANTES/DESPUES
-   Activa tambien el plan de ejecucion real (Ctrl+M en SSMS) y captura ambos planes.
-   --------------------------------------------------------------------- */
-DROP INDEX IF EXISTS IX_Tamizajes_Provincia_Anio ON dbo.tbl_tamizajes_salud_mental_limpio;
-GO
-SET STATISTICS IO ON;
-SET STATISTICS TIME ON;
+-- B) Los 10 departamentos con mas atenciones (todos los anios)
+SELECT TOP 10 departamento, SUM(total_atenciones) AS atenciones
+FROM dw.Resumen_Ubicacion
+GROUP BY departamento
+ORDER BY atenciones DESC;
 
-DECLARE @prov VARCHAR(50) = (SELECT TOP 1 provincia FROM dbo.tbl_tamizajes_salud_mental_limpio
-                             WHERE provincia IS NOT NULL ORDER BY provincia);
-DECLARE @anio SMALLINT = (SELECT MAX(anio) FROM dbo.tbl_tamizajes_salud_mental_limpio);
+-- C) Por sexo y etapa de vida
+SELECT sexo, etapa, SUM(total_atendidos) AS atendidos, SUM(total_atenciones) AS atenciones
+FROM dw.Resumen_Perfil
+GROUP BY sexo, etapa
+ORDER BY sexo, etapa;
 
-PRINT '=== ANTES DEL INDICE ===';
-CHECKPOINT; DBCC DROPCLEANBUFFERS;
-SELECT provincia, etapa, SUM(casos) AS total
-FROM dbo.tbl_tamizajes_salud_mental_limpio
-WHERE provincia = @prov AND anio = @anio
-GROUP BY provincia, etapa;
-
-CREATE NONCLUSTERED INDEX IX_Tamizajes_Provincia_Anio
-ON dbo.tbl_tamizajes_salud_mental_limpio (provincia, anio) INCLUDE (casos, etapa);
-
-PRINT '=== DESPUES DEL INDICE ===';
-CHECKPOINT; DBCC DROPCLEANBUFFERS;
-SELECT provincia, etapa, SUM(casos) AS total
-FROM dbo.tbl_tamizajes_salud_mental_limpio
-WHERE provincia = @prov AND anio = @anio
-GROUP BY provincia, etapa;
-
-SET STATISTICS IO OFF;
-SET STATISTICS TIME OFF;
+-- D) Evolucion mensual total
+SELECT * FROM dbo.vw_evolucion_mensual ORDER BY anio, nro_mes;
 GO
--- Copia de la pestana Messages: "logical reads" y "CPU time / elapsed time" antes vs despues.
-
-/* ---------------------------------------------------------------------
-   8. PRUEBAS Y EVIDENCIA (capturas para el informe y la sustentacion)
-   --------------------------------------------------------------------- */
--- 8.1 Funcion
-SELECT dbo.fn_grupo_etario(5) AS nino, dbo.fn_grupo_etario(15) AS adolescente,
-       dbo.fn_grupo_etario(40) AS adulto, dbo.fn_grupo_etario(NULL) AS nulo;
-GO
-
--- 8.2 Ingesta de atenciones con datos de prueba (esperado: 2 cargados, 4 en cuarentena)
-INSERT INTO dbo.staging_atenciones_mental (Co_Establecimiento, Nom_Establecimiento, Fecha_Atencion, Edad, Sexo, Diagnostico, Ubigeo) VALUES
- ('0001','HOSP A','2024-03-10','25','M','F32 Depresion','130101'),
- ('0001','HOSP A','2024-03-10','25','M','F32 Depresion','130101'),   -- duplicado
- ('0002','CS B','2024-03-11','34','F','','130201'),                   -- diagnostico vacio
- ('0002','CS B','2024-13-45','34','F','F41 Ansiedad','130201'),      -- fecha invalida
- ('0003','CS C','2024-03-12','150','F','F41 Ansiedad','130301'),     -- edad fuera de rango
- ('0003','CS C','2024-03-12','40','Femenino','F41 Ansiedad','130301'); -- valido
-GO
-EXEC dbo.usp_ingesta_y_validar_atenciones @lote_id = 'LOTE_PRUEBA_01';
-SELECT * FROM dbo.tbl_atenciones_salud_mental;
-SELECT * FROM dbo.tbl_cuarentena_atenciones WHERE lote_id = 'LOTE_PRUEBA_01';
-GO
-
--- 8.3 Trigger de auditoria: un UPDATE genera registro con valor anterior y nuevo
-UPDATE dbo.tbl_atenciones_salud_mental SET diagnostico = 'F32.1 Depresion moderada' WHERE co_establecimiento = '0001';
-SELECT TOP 10 * FROM dbo.log_auditoria ORDER BY id_log DESC;
-GO
-
--- 8.4 Trigger de integridad: debe rechazar y revertir (edad 200)
-BEGIN TRY
-    INSERT INTO dbo.tbl_atenciones_salud_mental (co_establecimiento, fecha_atencion, edad, sexo, diagnostico)
-    VALUES ('0009', '2024-01-01', 200, 'M', 'F41');
-    PRINT 'FALLO: el trigger no rechazo la fila.';
-END TRY
-BEGIN CATCH
-    PRINT CONCAT('OK, rechazado por el trigger: ', ERROR_MESSAGE());
-END CATCH;
-GO
-
--- 8.5 Tamizajes y ETL
-EXEC dbo.usp_procesar_tamizajes_salud_mental;
-SELECT COUNT(*) AS limpios FROM dbo.tbl_tamizajes_salud_mental_limpio;
-SELECT motivo_error, COUNT(*) AS filas FROM dbo.tbl_cuarentena_tamizajes GROUP BY motivo_error;  -- tabla de calidad del informe
-EXEC dbo.usp_etl_dw_tamizajes;
-SELECT * FROM dbo.etl_log ORDER BY id_etl DESC;
-SELECT (SELECT COUNT(*) FROM dbo.Fact_Tamizajes) AS hechos,
-       (SELECT COUNT(*) FROM dbo.Dim_Ubicacion) AS dim_ubicacion,
-       (SELECT COUNT(*) FROM dbo.Dim_Tiempo) AS dim_tiempo,
-       (SELECT COUNT(*) FROM dbo.Dim_Perfil) AS dim_perfil;
-GO
-
--- 8.6 Roles: cada prueba debe mostrar "OK bloqueado" donde corresponde
-EXECUTE AS USER = 'u_analista_test';
-BEGIN TRY
-    SELECT TOP 1 * FROM dbo.tbl_atenciones_salud_mental;
-    PRINT 'FALLO: el analista pudo leer la tabla base.';
-END TRY
-BEGIN CATCH
-    PRINT CONCAT('OK bloqueado (analista -> tabla base): ', ERROR_MESSAGE());
-END CATCH;
-SELECT TOP 5 * FROM dbo.vw_tamizajes_por_provincia;   -- esto SI debe funcionar
-REVERT;
-
-EXECUTE AS USER = 'u_auditor_test';
-BEGIN TRY
-    DELETE FROM dbo.log_auditoria;
-    PRINT 'FALLO: el auditor pudo borrar el log.';
-END TRY
-BEGIN CATCH
-    PRINT CONCAT('OK bloqueado (auditor -> borrar log): ', ERROR_MESSAGE());
-END CATCH;
-SELECT TOP 5 * FROM dbo.log_auditoria ORDER BY id_log DESC;   -- esto SI debe funcionar
-REVERT;
-GO
-
-/* ---------------------------------------------------------------------
-   9. POLITICA DE RESPALDO Y RESTORE PROBADO
-   Politica: FULL semanal + DIFFERENTIAL diario, con CHECKSUM y verificacion.
-   La carpeta debe existir y ser escribible por la cuenta del servicio de SQL Server.
-   (SQL Server Express no tiene Agent: programa con Task Scheduler + sqlcmd.)
-   --------------------------------------------------------------------- */
-USE master;
-GO
-BACKUP DATABASE BD_DataSalud_LaLibertad
-TO DISK = 'C:\Public\BD_DataSalud_LaLibertad_FULL.bak'
-WITH INIT, CHECKSUM, STATS = 10, NAME = 'DataSalud FULL';
-GO
--- (aqui pueden ocurrir cambios en la base; el diferencial solo guarda lo modificado desde el FULL)
-BACKUP DATABASE BD_DataSalud_LaLibertad
-TO DISK = 'C:\Public\BD_DataSalud_LaLibertad_DIFF.bak'
-WITH DIFFERENTIAL, INIT, CHECKSUM, STATS = 10, NAME = 'DataSalud DIFF';
-GO
-RESTORE VERIFYONLY FROM DISK = 'C:\Public\BD_DataSalud_LaLibertad_FULL.bak' WITH CHECKSUM;
-RESTORE VERIFYONLY FROM DISK = 'C:\Public\BD_DataSalud_LaLibertad_DIFF.bak' WITH CHECKSUM;
-GO
-
--- Verifica los nombres logicos de archivos antes del restore:
-RESTORE FILELISTONLY FROM DISK = 'C:\Public\BD_DataSalud_LaLibertad_FULL.bak';
-GO
-
--- Restore PROBADO en una base distinta (no pisa la original): FULL + DIFFERENTIAL
-RESTORE DATABASE BD_DataSalud_LaLibertad_TEST
-FROM DISK = 'C:\Public\BD_DataSalud_LaLibertad_FULL.bak'
-WITH MOVE 'BD_DataSalud_LaLibertad'     TO 'C:\Public\BD_DataSalud_LaLibertad_TEST.mdf',
-     MOVE 'BD_DataSalud_LaLibertad_log' TO 'C:\Public\BD_DataSalud_LaLibertad_TEST.ldf',
-     NORECOVERY, REPLACE;
-RESTORE DATABASE BD_DataSalud_LaLibertad_TEST
-FROM DISK = 'C:\Public\BD_DataSalud_LaLibertad_DIFF.bak'
-WITH RECOVERY;
-GO
-
--- Evidencia: los conteos deben ser iguales
-SELECT
-  (SELECT COUNT(*) FROM BD_DataSalud_LaLibertad.dbo.tbl_tamizajes_salud_mental_limpio)      AS original_limpios,
-  (SELECT COUNT(*) FROM BD_DataSalud_LaLibertad_TEST.dbo.tbl_tamizajes_salud_mental_limpio) AS restaurada_limpios,
-  (SELECT COUNT(*) FROM BD_DataSalud_LaLibertad.dbo.Fact_Tamizajes)      AS original_hechos,
-  (SELECT COUNT(*) FROM BD_DataSalud_LaLibertad_TEST.dbo.Fact_Tamizajes) AS restaurada_hechos;
-GO
--- Cuando captures la evidencia: DROP DATABASE BD_DataSalud_LaLibertad_TEST;
--- Anota el RPO (perdida maxima aceptable = intervalo del DIFF) y el RTO (tiempo medido del restore).
 ```
