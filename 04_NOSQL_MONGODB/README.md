@@ -1,99 +1,85 @@
-# 04 - NoSQL (MongoDB)
+# 04 · NoSQL con MongoDB
 
-Modelo documental de los **tamizajes de salud mental** (fuente: `DAT SALUD UTF8.csv`, MINSA/DIRESA).
-Se pasa de una tabla plana de 11 columnas a **un documento por distrito y mes**, con los tamizajes anidados.
+Carga de los datos de salud mental del Minsa (2017) en MongoDB y consultas de agregación para explorarlos.
 
-## Archivos de esta carpeta
+**Motor:** MongoDB Community + MongoDB Compass · **Base:** `datasalud_mongo`
 
-| Archivo | Contenido |
+## Archivos
+
+| Archivo | Descripción |
 |---|---|
-| `tamizajes_la_libertad_2017.json` | Solo La Libertad: 157 documentos (3 287 filas del CSV). Arreglo JSON, se ve bien en GitHub |
-| `tamizajes_peru_2017.jsonl.gz` | Todo el pais: 6 753 documentos (236 527 filas). Un documento por linea, comprimido |
+| `mamis_minsa_mongo.csv` | Atenciones del grupo Mamis. 106 registros, meses 1 a 8 de 2017. |
+| `atendidos_minsa_mongo.csv` | Atenciones de salud mental. 52 611 registros, meses 1 a 9 de 2017. |
+| `consultas.js` | Consultas de verificación y análisis, listas para pegar en mongosh. |
+| `Evidencias_Mongo.pdf` | Capturas de la importación y de cada consulta. |
 
-## Por que documentos y no tablas
+Los CSV están en UTF-8 sin BOM, separados por coma. Los diagnósticos que contienen una coma van entre comillas.
 
-- Cada documento agrupa todo lo ocurrido en un distrito en un mes: una sola lectura trae el cuadro completo.
-- `sexo`, `etapa`, `grupo` y `detalle` viajan juntos dentro de `tamizajes`, sin joins.
-- Se agregan `total_tamizajes` y `total_positivos` ya calculados. Se separan a proposito: los positivos son un
-  subconjunto de los tamizajes totales, por lo que **no deben sumarse entre si**.
+## Estructura de los datos
 
-## Estructura de un documento
+Cada fila del CSV es un documento. Campos:
 
-```json
-{
-  "_id": "2017-01-130108",
-  "anio": 2017,
-  "nro_mes": 1,
-  "ubicacion": { "ubigeo": "130108", "departamento": "LA LIBERTAD", "provincia": "TRUJILLO", "distrito": "POROTO" },
-  "total_tamizajes": 120,
-  "total_positivos": 0,
-  "tamizajes": [
-    { "sexo": "F", "etapa": "10 - 11", "grupo": "TOTAL DE TAMIZAJES",
-      "detalle": "VIOLENCIA FAMILIAR/MALTRATO INFANTIL", "casos": 2 }
-  ]
-}
-```
+| Campo | Tipo | Ejemplo |
+|---|---|---|
+| `Anio` | Int32 | 2017 |
+| `NroMes` | Int32 | 1 |
+| `ubigeo` | String | "20101" |
+| `Departamento`, `Provincia`, `Distrito` | String | "ANCASH", "HUARAZ", "HUARAZ" |
+| `Sexo` | String | "F" |
+| `Etapa` | String | "15 - 17" |
+| `Diagnostico` | String | "TRASTORNO DEPRESIVO" |
+| `Atendidos` | Int32 | 2 |
+| `Atenciones` | Int32 | 2 |
 
-## Notas de calidad de datos
+`ubigeo` se guarda como texto para no perder ceros ni tratarlo como número.
 
-- El CSV cubre **solo 2017, de enero a septiembre** (septiembre casi vacio: 871 filas).
-- Viene el **pais completo** (23 departamentos). Para el proyecto de La Libertad se genero el archivo filtrado.
-- El ubigeo `120135` (Santo Domingo de Acobamba) aparecia con dos provincias, HUANCAYO y CONCEPCION. Se unifico a
-  HUANCAYO en 52 filas. Sin esa correccion, esas filas se consideran duplicados por clave.
-- Verificacion: la suma de `casos` y el numero de tamizajes anidados coinciden exactamente con el CSV original.
+## Por qué MongoDB
 
-## Importar en MongoDB
+- Cada registro se guarda como un documento, sin necesidad de definir tablas y claves antes de cargar.
+- Los datos llegan como archivos planos y se importan directamente, sin pasar por un ETL.
+- Las consultas de agregación (`$group`, `$sort`, `$project`) resumen los datos de forma parecida a las vistas del modelo en SQL Server.
+- Permite comparar un enfoque documental con el modelo relacional y el warehouse del proyecto.
 
-```bash
-# La Libertad (arreglo JSON)
-mongoimport --db bd_datasalud --collection tamizajes_salud_mental \
-  --file tamizajes_la_libertad_2017.json --jsonArray
+## Cómo reproducirlo
 
-# Pais completo (descomprimir primero)
-gunzip -k tamizajes_peru_2017.jsonl.gz
-mongoimport --db bd_datasalud --collection tamizajes_peru \
-  --file tamizajes_peru_2017.jsonl
-```
+1. Abrir MongoDB Compass y conectarse a `mongodb://localhost:27017`.
+2. Crear la base `datasalud_mongo` con la colección `mamis`.
+3. En la colección, **Add Data > Import JSON or CSV file** y elegir `mamis_minsa_mongo.csv`.
+4. En la vista previa, delimitador **coma** y tipos de campo: `Anio`, `NroMes`, `Atendidos` y `Atenciones` como Int32; `ubigeo` y el resto como String.
+5. Crear la colección `atendidos` en la misma base y repetir con `atendidos_minsa_mongo.csv`.
+6. Abrir la pestaña **MONGOSH** y ejecutar las consultas de `consultas.js`.
 
-Si usas MongoDB Compass: *Add Data > Import JSON* y elige el archivo.
+## Verificación de la carga
 
-## Indices recomendados
+| Colección | Documentos | Suma de atendidos | Suma de atenciones |
+|---|---|---|---|
+| `mamis` | 106 | 19 | 203 |
+| `atendidos` | 52 611 | 81 796 | 155 303 |
 
-```javascript
-use bd_datasalud
-db.tamizajes_salud_mental.createIndex({ "ubicacion.provincia": 1, "anio": 1, "nro_mes": 1 })
-db.tamizajes_salud_mental.createIndex({ "ubicacion.ubigeo": 1 })
-```
+Estos valores coinciden con los archivos de origen y con los datos cargados en SQL Server (155 506 atenciones entre ambos archivos).
 
-## Consultas de ejemplo
+## Consultas
 
-```javascript
-// 1. Tamizajes totales por provincia
-db.tamizajes_salud_mental.aggregate([
-  { $group: { _id: "$ubicacion.provincia", total: { $sum: "$total_tamizajes" } } },
-  { $sort: { total: -1 } }
-])
+| Id | Qué responde | Tipo |
+|---|---|---|
+| A | Casos de Mamis en Cusco, ordenados por atenciones | `find` con filtro, proyección y orden |
+| B | Atenciones por diagnóstico | `aggregate` con `$group` y `$sort` |
+| C | Top 10 departamentos con más atenciones | `aggregate` con `$group`, `$sort` y `$limit` |
+| D | Evolución mensual de atendidos y atenciones | `aggregate` con `$group` por mes |
+| E | Atenciones por sexo y etapa de vida (Mamis) | `aggregate` con clave compuesta |
+| F | Atenciones por persona atendida, por diagnóstico | `aggregate` con `$project` y `$divide` |
+| G | Índice compuesto y plan de ejecución | `createIndex` y `explain("executionStats")` |
 
-// 2. Tendencia mensual
-db.tamizajes_salud_mental.aggregate([
-  { $group: { _id: "$nro_mes", total: { $sum: "$total_tamizajes" }, positivos: { $sum: "$total_positivos" } } },
-  { $sort: { _id: 1 } }
-])
+El código completo está en `consultas.js`, y las capturas de cada resultado en `Evidencias_Mongo.pdf`.
 
-// 3. Casos por tipo de tamizaje (solo tamizajes totales)
-db.tamizajes_salud_mental.aggregate([
-  { $unwind: "$tamizajes" },
-  { $match: { "tamizajes.grupo": "TOTAL DE TAMIZAJES" } },
-  { $group: { _id: "$tamizajes.detalle", casos: { $sum: "$tamizajes.casos" } } },
-  { $sort: { casos: -1 } }
-])
+## Resultados destacados
 
-// 4. Depresion en mujeres adultas (40-59) por distrito
-db.tamizajes_salud_mental.aggregate([
-  { $unwind: "$tamizajes" },
-  { $match: { "tamizajes.detalle": "TRASTORNO DEPRESIVO", "tamizajes.sexo": "F",
-              "tamizajes.etapa": "40 - 59", "tamizajes.grupo": "TOTAL DE TAMIZAJES" } },
-  { $group: { _id: "$ubicacion.distrito", casos: { $sum: "$tamizajes.casos" } } },
-  { $sort: { casos: -1 } }
-])
-```
+- El diagnóstico con más atenciones en `atendidos` es **violencia familiar / maltrato infantil** (59 297), seguido de **ansiedad** (39 807) y **trastorno depresivo** (35 430).
+- El departamento con más atenciones es **Lima** (24 452), seguido de **Callao** (18 645) y **Junín** (17 918).
+- En `mamis`, el departamento con más atenciones es **Cusco** (143) y el diagnóstico con más atenciones es **negligencia** (98).
+
+## Notas
+
+- Los datos cubren solo 2017: hasta septiembre en `atendidos` y hasta agosto en `mamis`.
+- `Atendidos` es un acumulado por fila. Sumarlo entre meses, etapas o diagnósticos puede contar dos veces a la misma persona, así que no equivale a personas únicas.
+- Las consultas que usan `Atenciones` y `Atendidos` se calculan sobre los mismos datos que usa el informe de Power BI (carpeta `06_POWER_BI`).
